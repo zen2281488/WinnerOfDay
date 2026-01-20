@@ -111,6 +111,11 @@ GROQ_TEMPERATURE=0.9
 - **Ошибки JSON от Groq** — попробуй уменьшить `GROQ_TEMPERATURE` (например, `0.4`) и повторить
 - **Бот молчит** — используй команду (например, `/кто`) и проверь права сообщества на сообщения
 - **Docker engine error (Windows)** — убедись, что Docker Desktop запущен с Linux engine
+- **Debian bullseye: 404 / bullseye-backports** — удали backports и установи Docker через get.docker.com:
+
+```bash
+sudo sed -i '/bullseye-backports/d' /etc/apt/sources.list /etc/apt/sources.list.d/*.list && sudo apt-get update && sudo apt-get install -y curl git && curl -fsSL https://get.docker.com | sh && sudo systemctl enable --now docker
+```
 
 ## Примечания
 
