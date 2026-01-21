@@ -74,6 +74,7 @@ async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS messages (user_id INTEGER, peer_id INTEGER, text TEXT, timestamp INTEGER, username TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS daily_game (peer_id INTEGER, date TEXT, winner_id INTEGER, reason TEXT, PRIMARY KEY (peer_id, date))")
+        await db.execute("CREATE TABLE IF NOT EXISTS last_winner (peer_id INTEGER PRIMARY KEY, winner_id INTEGER, timestamp INTEGER)")
         await db.execute("CREATE TABLE IF NOT EXISTS schedules (peer_id INTEGER PRIMARY KEY, time TEXT)")
         await db.commit()
 
@@ -200,12 +201,20 @@ async def run_game_logic(peer_id: int, reset_if_exists: bool = False):
 
         # Сбор сообщений
         cursor = await db.execute(
-            "SELECT winner_id FROM daily_game WHERE peer_id = ? ORDER BY date DESC LIMIT 1",
+            "SELECT winner_id FROM last_winner WHERE peer_id = ? LIMIT 1",
             (peer_id,)
         )
         row = await cursor.fetchone()
         if row:
             last_winner_id = row[0]
+        else:
+            cursor = await db.execute(
+                "SELECT winner_id FROM daily_game WHERE peer_id = ? ORDER BY date DESC LIMIT 1",
+                (peer_id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                last_winner_id = row[0]
 
         cursor = await db.execute("""
             SELECT user_id, text, username 
@@ -252,6 +261,10 @@ async def run_game_logic(peer_id: int, reset_if_exists: bool = False):
         await db.execute(
             "INSERT INTO daily_game (peer_id, date, winner_id, reason) VALUES (?, ?, ?, ?)", 
             (peer_id, today, winner_id, reason)
+        )
+        await db.execute(
+            "INSERT OR REPLACE INTO last_winner (peer_id, winner_id, timestamp) VALUES (?, ?, ?)",
+            (peer_id, winner_id, int(datetime.datetime.now().timestamp()))
         )
         await db.commit()
 
