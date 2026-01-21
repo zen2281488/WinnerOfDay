@@ -23,6 +23,9 @@ try:
 except ValueError:
     GROQ_TEMPERATURE = 0.9
 
+BUILD_DATE = os.getenv("BUILD_DATE", "unknown")
+BUILD_SHA = os.getenv("BUILD_SHA", "")
+
 if not VK_TOKEN or not GROQ_API_KEY:
     print("❌ ОШИБКА: Не найдены VK_TOKEN или GROQ_API_KEY!")
     sys.exit(1)
@@ -301,7 +304,8 @@ async def show_settings(message: Message):
         f"⚙️ **НАСТРОЙКИ БОТА**\n\n"
         f"🧠 **Модель:** `{GROQ_MODEL}`\n"
         f"🔑 **Ключ:** `{key_short}`\n"
-        f"🌡 **Температура:** `{GROQ_TEMPERATURE}`\n\n"
+        f"🌡 **Температура:** `{GROQ_TEMPERATURE}`\n"
+        f"Build: `{BUILD_DATE}`\n\n"
         f"**🛠 Админка:**\n"
         f"• `{CMD_SET_MODEL} <id>` — Сменить модель\n"
         f"• `{CMD_SET_KEY} <ключ>` — Новый API ключ\n"
