@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import json
 import random
@@ -36,6 +36,7 @@ CMD_TIME_RESET = "/сброс_времени"
 CMD_SETTINGS = "/настройки"
 CMD_SET_MODEL = "/установить_модель"
 CMD_SET_KEY = "/установить_ключ"
+CMD_SET_TEMPERATURE = "/установить_температуру"
 CMD_LIST_MODELS = "/список_моделей"
 
 DB_NAME = os.getenv("DB_PATH", "chat_history.db")
@@ -290,6 +291,7 @@ async def show_settings(message: Message):
         f"**🛠 Админка:**\n"
         f"• `{CMD_SET_MODEL} <id>` — Сменить модель\n"
         f"• `{CMD_SET_KEY} <ключ>` — Новый API ключ\n"
+        f"• `{CMD_SET_TEMPERATURE} <0.0-2.0>` - установить температуру\n"
         f"• `{CMD_LIST_MODELS}` — Список моделей (Live)\n\n"
         f"**🎮 Игра:**\n"
         f"• `{CMD_RUN}` — Найти пидора дня\n"
@@ -348,6 +350,25 @@ async def set_key_handler(message: Message):
     await message.answer("✅ API ключ обновлен. Клиент перезапущен.")
 
 # ================= ОБЫЧНЫЕ КОМАНДЫ =================
+
+@bot.on.message(StartswithRule(CMD_SET_TEMPERATURE))
+async def set_temperature_handler(message: Message):
+    global GROQ_TEMPERATURE
+    args = message.text.replace(CMD_SET_TEMPERATURE, "").strip()
+    if not args:
+        await message.answer(f"Укажи температуру!\nПример: `{CMD_SET_TEMPERATURE} 0.9`")
+        return
+    try:
+        value = float(args.replace(",", "."))
+    except ValueError:
+        await message.answer("Неверное значение температуры. Используй число, например 0.7")
+        return
+    if value < 0 or value > 2:
+        await message.answer("Температура должна быть в диапазоне 0.0-2.0")
+        return
+    GROQ_TEMPERATURE = value
+    os.environ["GROQ_TEMPERATURE"] = str(value)
+    await message.answer(f"Температура установлена: `{GROQ_TEMPERATURE}`")
 
 @bot.on.message(text=CMD_RESET)
 async def reset_daily_game(message: Message):
