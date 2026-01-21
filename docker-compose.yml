@@ -1,6 +1,6 @@
 services:
   vk-bot:
-    build: .
+    image: ghcr.io/zen2281488/gayofday:latest
     container_name: gay_of_the_day_bot
     restart: unless-stopped
     # Загружаем секреты из файла .env
@@ -13,3 +13,14 @@ services:
     volumes:
       # Пробрасываем файл базы данных наружу, чтобы не терять историю при редеплое
       - ./data:/app/data
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOME}/.docker/config.json:/config.json:ro
+    command: --interval 300 --cleanup --label-enable
