@@ -77,11 +77,13 @@ async def init_db():
         await db.commit()
 
 # ================= LLM ЛОГИКА =================
-async def choose_winner_via_groq(chat_log: list) -> dict:
+async def choose_winner_via_groq(chat_log: list, excluded_user_id=None) -> dict:
     context_lines = []
     available_ids = set()
     
     for uid, text, name in chat_log:
+        if excluded_user_id is not None and uid == excluded_user_id:
+            continue
         if len(text.strip()) < 3:
             continue
         safe_name = name if name else "Unknown"
@@ -165,6 +167,8 @@ async def run_game_logic(peer_id: int, reset_if_exists: bool = False):
     reset_if_exists=False: (По умолчанию) Если играем вручную, бот скажет 'Уже выбрали'.
     """
     today = datetime.date.today().isoformat()
+    last_winner_id = None
+    exclude_user_id = None
     
     async def send_msg(text):
         try:
@@ -194,6 +198,14 @@ async def run_game_logic(peer_id: int, reset_if_exists: bool = False):
             return
 
         # Сбор сообщений
+        cursor = await db.execute(
+            "SELECT winner_id FROM daily_game WHERE peer_id = ? ORDER BY date DESC LIMIT 1",
+            (peer_id,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            last_winner_id = row[0]
+
         cursor = await db.execute("""
             SELECT user_id, text, username 
             FROM messages 
@@ -209,11 +221,14 @@ async def run_game_logic(peer_id: int, reset_if_exists: bool = False):
             return
 
         chat_log = list(reversed(rows))
+        candidate_ids = {uid for uid, text, _ in chat_log if len(text.strip()) >= 3}
+        if last_winner_id is not None and last_winner_id in candidate_ids and len(candidate_ids) > 1:
+            exclude_user_id = last_winner_id
 
     await send_msg(f"🎲 Изучаю {len(chat_log)} сообщений... Кто же сегодня опозорится?")
     
     try:
-        decision = await choose_winner_via_groq(chat_log)
+        decision = await choose_winner_via_groq(chat_log, excluded_user_id=exclude_user_id)
         winner_id = decision['user_id']
         reason = decision.get('reason', 'Нет причины')
         
