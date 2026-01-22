@@ -10,25 +10,74 @@ import re
 from collections import Counter
 from vkbottle.bot import Bot, Message
 from vkbottle.dispatch.rules import ABCRule # Для создания своего правила
-from groq import AsyncGroq
 import logging
+import httpx
+try:
+    from groq import AsyncGroq
+except ImportError:
+    AsyncGroq = None
 
 # ================= НАСТРОЙКИ =================
 VK_TOKEN = os.getenv("VK_TOKEN")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
 try:
     GROQ_TEMPERATURE = float(os.getenv("GROQ_TEMPERATURE", "0.9"))
 except ValueError:
     GROQ_TEMPERATURE = 0.9
 
+VENICE_API_KEY = os.getenv("VENICE_API_KEY")
+VENICE_MODEL = os.getenv("VENICE_MODEL", "llama-3.3-70b")
+VENICE_BASE_URL = os.getenv("VENICE_BASE_URL", "https://api.venice.ai/api/v1/")
+if not VENICE_BASE_URL.endswith("/"):
+    VENICE_BASE_URL += "/"
+
+try:
+    VENICE_TEMPERATURE = float(os.getenv("VENICE_TEMPERATURE", "0.9"))
+except ValueError:
+    VENICE_TEMPERATURE = 0.9
+
+try:
+    VENICE_TIMEOUT = float(os.getenv("VENICE_TIMEOUT", "30"))
+except ValueError:
+    VENICE_TIMEOUT = 30.0
+
+VENICE_INCLUDE_SYSTEM_PROMPT = os.getenv("VENICE_INCLUDE_SYSTEM_PROMPT", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+if not LLM_PROVIDER:
+    if VENICE_API_KEY and not GROQ_API_KEY:
+        LLM_PROVIDER = "venice"
+    else:
+        LLM_PROVIDER = "groq"
+
 BUILD_DATE = os.getenv("BUILD_DATE", "unknown")
 BUILD_SHA = os.getenv("BUILD_SHA", "")
 
-if not VK_TOKEN or not GROQ_API_KEY:
-    print("❌ ОШИБКА: Не найдены VK_TOKEN или GROQ_API_KEY!")
+if not VK_TOKEN:
+    print("❌ ОШИБКА: Не найден VK_TOKEN!")
     sys.exit(1)
+
+if LLM_PROVIDER not in ("groq", "venice"):
+    print("❌ ОШИБКА: LLM_PROVIDER должен быть groq или venice!")
+    sys.exit(1)
+
+if LLM_PROVIDER == "groq":
+    if not GROQ_API_KEY:
+        print("❌ ОШИБКА: Не найден GROQ_API_KEY при выбранном провайдере groq!")
+        sys.exit(1)
+    if AsyncGroq is None:
+        print("❌ ОШИБКА: Пакет groq не установлен, но выбран провайдер groq!")
+        sys.exit(1)
+else:
+    if not VENICE_API_KEY:
+        print("❌ ОШИБКА: Не найден VENICE_API_KEY при выбранном провайдере venice!")
+        sys.exit(1)
 
 # === КОМАНДЫ ===
 GAME_TITLE = os.getenv("GAME_TITLE", "Пидор дня")
@@ -41,6 +90,7 @@ CMD_SETTINGS = "/настройки"
 CMD_SET_MODEL = "/установить_модель"
 CMD_SET_KEY = "/установить_ключ"
 CMD_SET_TEMPERATURE = "/установить_температуру"
+CMD_SET_PROVIDER = "/провайдер"
 CMD_LIST_MODELS = "/список_моделей"
 CMD_LEADERBOARD = "/лидерборд"
 CMD_LEADERBOARD_TIMER_SET = "/таймер_лидерборда"
@@ -99,7 +149,23 @@ def render_user_prompt(context_text: str) -> str:
 
 
 bot = Bot(token=VK_TOKEN)
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+groq_client = AsyncGroq(api_key=GROQ_API_KEY) if LLM_PROVIDER == "groq" and AsyncGroq else None
+
+def build_venice_headers() -> dict:
+    return {"Authorization": f"Bearer {VENICE_API_KEY}"}
+
+async def venice_request(method: str, path: str, **kwargs) -> httpx.Response:
+    headers = kwargs.pop("headers", {})
+    request_headers = {**build_venice_headers(), **headers}
+    timeout = httpx.Timeout(VENICE_TIMEOUT)
+    async with httpx.AsyncClient(base_url=VENICE_BASE_URL, timeout=timeout) as client:
+        response = await client.request(method, path, headers=request_headers, **kwargs)
+    if response.status_code >= 400:
+        message = response.text.strip()
+        if len(message) > 500:
+            message = message[:500] + "..."
+        raise RuntimeError(f"HTTP {response.status_code}: {message}")
+    return response
 
 # ================= БАЗА ДАННЫХ =================
 async def init_db():
@@ -112,7 +178,51 @@ async def init_db():
         await db.commit()
 
 # ================= LLM ЛОГИКА =================
-async def choose_winner_via_groq(chat_log: list, excluded_user_id=None) -> dict:
+async def fetch_llm_content(system_prompt: str, user_prompt: str) -> str:
+    if LLM_PROVIDER == "venice":
+        print(f"DEBUG: Sending request to Venice. Model: {VENICE_MODEL}, Temp: {VENICE_TEMPERATURE}")
+        payload = {
+            "model": VENICE_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": VENICE_TEMPERATURE,
+            "max_tokens": 800,
+            "venice_parameters": {
+                "include_venice_system_prompt": VENICE_INCLUDE_SYSTEM_PROMPT,
+            },
+        }
+        response = await venice_request("POST", "chat/completions", json=payload)
+        response_data = response.json()
+        content = (
+            (response_data.get("choices") or [{}])[0]
+            .get("message", {})
+            .get("content")
+        )
+        if not content:
+            raise ValueError("Empty content in Venice response")
+        return content
+
+    if not groq_client:
+        raise RuntimeError("Groq client is not initialized")
+    print(f"DEBUG: Sending request to Groq. Model: {GROQ_MODEL}, Temp: {GROQ_TEMPERATURE}")
+    completion = await groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=GROQ_TEMPERATURE,
+        max_tokens=800,
+    )
+    content = completion.choices[0].message.content
+    if not content:
+        raise ValueError("Empty content in Groq response")
+    return content
+
+
+async def choose_winner_via_llm(chat_log: list, excluded_user_id=None) -> dict:
     context_lines = []
     available_ids = set()
     
@@ -133,19 +243,7 @@ async def choose_winner_via_groq(chat_log: list, excluded_user_id=None) -> dict:
     user_prompt = render_user_prompt(context_text)
 
     try:
-        print(f"DEBUG: Sending request to Groq. Model: {GROQ_MODEL}, Temp: {GROQ_TEMPERATURE}")
-        
-        completion = await groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=GROQ_TEMPERATURE,
-            max_tokens=800
-        )
-        
-        content = completion.choices[0].message.content
+        content = await fetch_llm_content(SYSTEM_PROMPT, user_prompt)
         
         try:
             result = json.loads(content)
@@ -170,7 +268,7 @@ async def choose_winner_via_groq(chat_log: list, excluded_user_id=None) -> dict:
         return result
 
     except Exception as e:
-        print(f"ERROR: Groq API error: {type(e).__name__}: {e}")
+        print(f"ERROR: LLM API error ({LLM_PROVIDER}): {type(e).__name__}: {e}")
         traceback.print_exc()
     
     # Fallback
@@ -264,7 +362,7 @@ async def run_game_logic(peer_id: int, reset_if_exists: bool = False):
     await send_msg(f"🎲 Изучаю {len(chat_log)} сообщений... Кто же сегодня опозорится?")
     
     try:
-        decision = await choose_winner_via_groq(chat_log, excluded_user_id=exclude_user_id)
+        decision = await choose_winner_via_llm(chat_log, excluded_user_id=exclude_user_id)
         winner_id = decision['user_id']
         reason = decision.get('reason', 'Нет причины')
         
@@ -426,7 +524,15 @@ async def scheduler_loop():
 
 @bot.on.message(text=CMD_SETTINGS)
 async def show_settings(message: Message):
-    key_short = GROQ_API_KEY[:5] + "..." if GROQ_API_KEY else "???"
+    provider_label = "Groq" if LLM_PROVIDER == "groq" else "Venice"
+    if LLM_PROVIDER == "groq":
+        key_short = GROQ_API_KEY[:5] + "..." if GROQ_API_KEY else "???"
+        active_model = GROQ_MODEL
+        active_temperature = GROQ_TEMPERATURE
+    else:
+        key_short = VENICE_API_KEY[:5] + "..." if VENICE_API_KEY else "???"
+        active_model = VENICE_MODEL
+        active_temperature = VENICE_TEMPERATURE
     schedule_time = None
     leaderboard_day = None
     leaderboard_time = None
@@ -449,17 +555,19 @@ async def show_settings(message: Message):
         leaderboard_line = "Лидерборд (МСК): не установлен\n"
     text = (
         f"🎛 **Настройки игры**\n\n"
-        f"🎯 **Модель:** `{GROQ_MODEL}`\n"
+        f"🤖 **Провайдер:** `{provider_label}`\n"
+        f"🎯 **Модель:** `{active_model}`\n"
         f"🔑 **Ключ:** `{key_short}`\n"
-        f"🌡 **Температура:** `{GROQ_TEMPERATURE}`\n"
+        f"🌡 **Температура:** `{active_temperature}`\n"
         f"Последнее обновление: {format_build_date(BUILD_DATE)}\n"
         f"{schedule_line}\n"
         f"{leaderboard_line}\n"
         f"**⚙ Команды:**\n"
+        f"• `{CMD_SET_PROVIDER} groq|venice` - Выбрать провайдера\n"
         f"• `{CMD_SET_MODEL} <id>` - Сменить модель\n"
         f"• `{CMD_SET_KEY} <ключ>` - Новый API ключ\n"
         f"• `{CMD_SET_TEMPERATURE} <0.0-2.0>` - Установить температуру\n"
-        f"• `{CMD_LIST_MODELS}` - Список моделей (Live)\n\n"
+        f"• `{CMD_LIST_MODELS} [type]` - Список моделей (Live)\n\n"
         f"**🎮 Игра:**\n"
         f"• `{CMD_RUN}` - Найти пидора дня\n"
         f"• `{CMD_RESET}` - Сброс результата сегодня\n"
@@ -472,24 +580,69 @@ async def show_settings(message: Message):
     await message.answer(text)
 @bot.on.message(text=CMD_LIST_MODELS)
 async def list_models_handler(message: Message):
-    msg = await message.answer(f"🔄 Связываюсь с API Groq...")
+    args = message.text.replace(CMD_LIST_MODELS, "").strip().lower()
+    if LLM_PROVIDER == "groq":
+        await message.answer("🔄 Связываюсь с API Groq...")
+        try:
+            if not groq_client:
+                raise RuntimeError("Groq client is not initialized")
+            models_response = await groq_client.models.list()
+            active_models = sorted([m.id for m in models_response.data], key=lambda x: (not x.startswith("llama"), x))
+
+            if not active_models:
+                await message.answer("❌ Список моделей пуст (возможно проблема с ключом).")
+                return
+
+            models_text = "\n".join([f"• `{m}`" for m in active_models[:20]])
+            example_model = active_models[0] if active_models else "ваша_модель"
+
+            await message.answer(
+                f"📜 **Доступные модели (Live API):**\n\n{models_text}\n\n"
+                f"Чтобы применить, скопируй ID и напиши:\n"
+                f"{CMD_SET_MODEL} {example_model}"
+            )
+        except Exception as e:
+            await message.answer(f"❌ Ошибка API:\n{e}")
+        return
+
+    await message.answer("🔄 Связываюсь с API Venice...")
     try:
-        models_response = await groq_client.models.list()
-        
-        # Сортировка: Llama вперед
-        active_models = sorted([m.id for m in models_response.data], key=lambda x: (not x.startswith("llama"), x))
-        
-        if not active_models:
+        venice_type = None
+        if args:
+            allowed_types = {
+                "asr",
+                "embedding",
+                "image",
+                "text",
+                "tts",
+                "upscale",
+                "inpaint",
+                "video",
+                "all",
+                "code",
+            }
+            if args not in allowed_types:
+                await message.answer(
+                    "❌ Неверный тип. Примеры: text, image, video, all."
+                )
+                return
+            venice_type = args
+        params = {"type": venice_type} if venice_type else None
+        response = await venice_request("GET", "models", params=params)
+        models_response = response.json()
+        model_ids = sorted({m.get("id") for m in models_response.get("data", []) if m.get("id")})
+
+        if not model_ids:
             await message.answer("❌ Список моделей пуст (возможно проблема с ключом).")
             return
 
-        # Берем топ-20
-        models_text = "\n".join([f"• `{m}`" for m in active_models[:20]])
-        
+        models_text = "\n".join([f"• `{m}`" for m in model_ids[:20]])
+        example_model = model_ids[0] if model_ids else "ваша_модель"
+
         await message.answer(
             f"📜 **Доступные модели (Live API):**\n\n{models_text}\n\n"
             f"Чтобы применить, скопируй ID и напиши:\n"
-            f"{CMD_SET_MODEL} llama-3.3-70b-versatile"
+            f"{CMD_SET_MODEL} {example_model}"
         )
     except Exception as e:
         await message.answer(f"❌ Ошибка API:\n{e}")
@@ -502,32 +655,72 @@ async def leaderboard_handler(message: Message):
 
 @bot.on.message(StartswithRule(CMD_SET_MODEL))
 async def set_model_handler(message: Message):
-    global GROQ_MODEL
+    global GROQ_MODEL, VENICE_MODEL
     args = message.text.replace(CMD_SET_MODEL, "").strip()
     if not args:
-        await message.answer(f"❌ Укажите модель!\nПример: `{CMD_SET_MODEL} llama-3.3-70b-versatile`")
+        await message.answer(f"❌ Укажите модель!\nПример: `{CMD_SET_MODEL} llama-3.3-70b`")
         return
-    GROQ_MODEL = args
-    os.environ["GROQ_MODEL"] = args
-    await message.answer(f"✅ Модель изменена на: `{GROQ_MODEL}`")
+    if LLM_PROVIDER == "groq":
+        GROQ_MODEL = args
+        os.environ["GROQ_MODEL"] = args
+        await message.answer(f"✅ Модель изменена на: `{GROQ_MODEL}`")
+        return
+    VENICE_MODEL = args
+    os.environ["VENICE_MODEL"] = args
+    await message.answer(f"✅ Модель изменена на: `{VENICE_MODEL}`")
+
+@bot.on.message(StartswithRule(CMD_SET_PROVIDER))
+async def set_provider_handler(message: Message):
+    global LLM_PROVIDER, groq_client
+    args = message.text.replace(CMD_SET_PROVIDER, "").strip().lower()
+    if not args:
+        await message.answer(f"Укажи провайдера!\nПример: `{CMD_SET_PROVIDER} groq`")
+        return
+    if args not in ("groq", "venice"):
+        await message.answer("Неверный провайдер. Используй: groq или venice.")
+        return
+    if args == "groq":
+        if not GROQ_API_KEY:
+            await message.answer("❌ Не найден GROQ_API_KEY. Сначала укажи ключ.")
+            return
+        if AsyncGroq is None:
+            await message.answer("❌ Пакет groq не установлен.")
+            return
+        groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+    else:
+        if not VENICE_API_KEY:
+            await message.answer("❌ Не найден VENICE_API_KEY. Сначала укажи ключ.")
+            return
+        groq_client = None
+    LLM_PROVIDER = args
+    os.environ["LLM_PROVIDER"] = args
+    await message.answer(f"✅ Провайдер изменен на: `{LLM_PROVIDER}`")
 
 @bot.on.message(StartswithRule(CMD_SET_KEY))
 async def set_key_handler(message: Message):
-    global GROQ_API_KEY, groq_client
+    global GROQ_API_KEY, VENICE_API_KEY, groq_client
     args = message.text.replace(CMD_SET_KEY, "").strip()
     if not args:
         await message.answer("❌ Укажите ключ!")
         return
-    GROQ_API_KEY = args
-    os.environ["GROQ_API_KEY"] = args
-    groq_client = AsyncGroq(api_key=GROQ_API_KEY)
-    await message.answer("✅ API ключ обновлен. Клиент перезапущен.")
+    if LLM_PROVIDER == "groq":
+        if AsyncGroq is None:
+            await message.answer("❌ Пакет groq не установлен.")
+            return
+        GROQ_API_KEY = args
+        os.environ["GROQ_API_KEY"] = args
+        groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+        await message.answer("✅ API ключ Groq обновлен. Клиент перезапущен.")
+        return
+    VENICE_API_KEY = args
+    os.environ["VENICE_API_KEY"] = args
+    await message.answer("✅ API ключ Venice обновлен.")
 
 # ================= ОБЫЧНЫЕ КОМАНДЫ =================
 
 @bot.on.message(StartswithRule(CMD_SET_TEMPERATURE))
 async def set_temperature_handler(message: Message):
-    global GROQ_TEMPERATURE
+    global GROQ_TEMPERATURE, VENICE_TEMPERATURE
     args = message.text.replace(CMD_SET_TEMPERATURE, "").strip()
     if not args:
         await message.answer(f"Укажи температуру!\nПример: `{CMD_SET_TEMPERATURE} 0.9`")
@@ -540,9 +733,14 @@ async def set_temperature_handler(message: Message):
     if value < 0 or value > 2:
         await message.answer("Температура должна быть в диапазоне 0.0-2.0")
         return
-    GROQ_TEMPERATURE = value
-    os.environ["GROQ_TEMPERATURE"] = str(value)
-    await message.answer(f"Температура установлена: `{GROQ_TEMPERATURE}`")
+    if LLM_PROVIDER == "groq":
+        GROQ_TEMPERATURE = value
+        os.environ["GROQ_TEMPERATURE"] = str(value)
+        await message.answer(f"Температура установлена: `{GROQ_TEMPERATURE}`")
+        return
+    VENICE_TEMPERATURE = value
+    os.environ["VENICE_TEMPERATURE"] = str(value)
+    await message.answer(f"Температура установлена: `{VENICE_TEMPERATURE}`")
 
 @bot.on.message(text=CMD_RESET)
 async def reset_daily_game(message: Message):
