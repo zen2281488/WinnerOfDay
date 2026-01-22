@@ -49,6 +49,18 @@ CMD_LEADERBOARD_TIMER_RESET = "/сброс_таймера_лидерборда"
 DB_NAME = os.getenv("DB_PATH", "chat_history.db")
 MSK_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
+def format_build_date(value: str) -> str:
+    if not value or value == "unknown":
+        return "неизвестно"
+    try:
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(normalized)
+        return dt.strftime("%d.%m.%y в %H:%M")
+    except Exception:
+        return value
+
 # 🔥 КЛАСС ПРАВИЛА (Чтобы работало startswith) 🔥
 class StartswithRule(ABCRule[Message]):
     def __init__(self, prefix: str):
@@ -437,7 +449,7 @@ async def show_settings(message: Message):
         f"🎯 **Модель:** `{GROQ_MODEL}`\n"
         f"🔑 **Ключ:** `{key_short}`\n"
         f"🌡 **Температура:** `{GROQ_TEMPERATURE}`\n"
-        f"Build: `{BUILD_DATE}`\n"
+        f"Последнее обновление: {format_build_date(BUILD_DATE)}\n"
         f"{schedule_line}\n"
         f"{leaderboard_line}\n"
         f"**⚙ Команды:**\n"
