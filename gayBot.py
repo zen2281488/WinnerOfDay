@@ -57,6 +57,9 @@ def format_build_date(value: str) -> str:
         if normalized.endswith("Z"):
             normalized = normalized[:-1] + "+00:00"
         dt = datetime.datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        dt = dt.astimezone(MSK_TZ)
         return dt.strftime("%d.%m.%y в %H:%M")
     except Exception:
         return value
