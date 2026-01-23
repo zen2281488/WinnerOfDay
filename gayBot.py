@@ -556,6 +556,7 @@ async def show_settings(message: Message):
     text = (
         f"🎛 **Настройки игры**\n\n"
         f"🤖 **Провайдер:** `{provider_label}`\n"
+        f"📦 **Доступные провайдеры:** `groq`, `venice`\n"
         f"🎯 **Модель:** `{active_model}`\n"
         f"🔑 **Ключ:** `{key_short}`\n"
         f"🌡 **Температура:** `{active_temperature}`\n"
@@ -565,9 +566,9 @@ async def show_settings(message: Message):
         f"**⚙ Команды:**\n"
         f"• `{CMD_SET_PROVIDER} groq|venice` - Выбрать провайдера\n"
         f"• `{CMD_SET_MODEL} <id>` - Сменить модель\n"
-        f"• `{CMD_SET_KEY} <ключ>` - Новый API ключ\n"
+        f"• `{CMD_SET_KEY} <провайдер> <ключ>` - Новый API ключ\n"
         f"• `{CMD_SET_TEMPERATURE} <0.0-2.0>` - Установить температуру\n"
-        f"• `{CMD_LIST_MODELS} [type]` - Список моделей (Live)\n\n"
+        f"• `{CMD_LIST_MODELS} <провайдер>` - Список моделей (Live)\n\n"
         f"**🎮 Игра:**\n"
         f"• `{CMD_RUN}` - Найти пидора дня\n"
         f"• `{CMD_RESET}` - Сброс результата сегодня\n"
@@ -581,12 +582,22 @@ async def show_settings(message: Message):
 @bot.on.message(text=CMD_LIST_MODELS)
 async def list_models_handler(message: Message):
     args = message.text.replace(CMD_LIST_MODELS, "").strip().lower()
-    if LLM_PROVIDER == "groq":
+    if not args:
+        await message.answer(f"❌ Укажи провайдера: groq или venice.\nПример: `{CMD_LIST_MODELS} groq`")
+        return
+    provider = args
+    if provider not in ("groq", "venice"):
+        await message.answer("❌ Неверный провайдер. Используй: groq или venice.")
+        return
+    if provider == "groq":
         await message.answer("🔄 Связываюсь с API Groq...")
         try:
-            if not groq_client:
-                raise RuntimeError("Groq client is not initialized")
-            models_response = await groq_client.models.list()
+            if not GROQ_API_KEY:
+                raise RuntimeError("Не найден GROQ_API_KEY")
+            if AsyncGroq is None:
+                raise RuntimeError("Пакет groq не установлен")
+            client = groq_client or AsyncGroq(api_key=GROQ_API_KEY)
+            models_response = await client.models.list()
             active_models = sorted([m.id for m in models_response.data], key=lambda x: (not x.startswith("llama"), x))
 
             if not active_models:
@@ -607,28 +618,9 @@ async def list_models_handler(message: Message):
 
     await message.answer("🔄 Связываюсь с API Venice...")
     try:
-        venice_type = None
-        if args:
-            allowed_types = {
-                "asr",
-                "embedding",
-                "image",
-                "text",
-                "tts",
-                "upscale",
-                "inpaint",
-                "video",
-                "all",
-                "code",
-            }
-            if args not in allowed_types:
-                await message.answer(
-                    "❌ Неверный тип. Примеры: text, image, video, all."
-                )
-                return
-            venice_type = args
-        params = {"type": venice_type} if venice_type else None
-        response = await venice_request("GET", "models", params=params)
+        if not VENICE_API_KEY:
+            raise RuntimeError("Не найден VENICE_API_KEY")
+        response = await venice_request("GET", "models")
         models_response = response.json()
         model_ids = sorted({m.get("id") for m in models_response.get("data", []) if m.get("id")})
 
@@ -701,19 +693,30 @@ async def set_key_handler(message: Message):
     global GROQ_API_KEY, VENICE_API_KEY, groq_client
     args = message.text.replace(CMD_SET_KEY, "").strip()
     if not args:
-        await message.answer("❌ Укажите ключ!")
+        await message.answer(f"❌ Укажите провайдера и ключ!\nПример: `{CMD_SET_KEY} groq gsk_***`")
         return
-    if LLM_PROVIDER == "groq":
+    parts = args.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(f"❌ Укажите провайдера и ключ!\nПример: `{CMD_SET_KEY} venice vnk_***`")
+        return
+    provider, key = parts[0].lower(), parts[1].strip()
+    if provider not in ("groq", "venice"):
+        await message.answer("❌ Неверный провайдер. Используй: groq или venice.")
+        return
+    if provider == "groq":
         if AsyncGroq is None:
             await message.answer("❌ Пакет groq не установлен.")
             return
-        GROQ_API_KEY = args
-        os.environ["GROQ_API_KEY"] = args
-        groq_client = AsyncGroq(api_key=GROQ_API_KEY)
-        await message.answer("✅ API ключ Groq обновлен. Клиент перезапущен.")
+        GROQ_API_KEY = key
+        os.environ["GROQ_API_KEY"] = key
+        if LLM_PROVIDER == "groq":
+            groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+            await message.answer("✅ API ключ Groq обновлен. Клиент перезапущен.")
+        else:
+            await message.answer("✅ API ключ Groq обновлен.")
         return
-    VENICE_API_KEY = args
-    os.environ["VENICE_API_KEY"] = args
+    VENICE_API_KEY = key
+    os.environ["VENICE_API_KEY"] = key
     await message.answer("✅ API ключ Venice обновлен.")
 
 # ================= ОБЫЧНЫЕ КОМАНДЫ =================
