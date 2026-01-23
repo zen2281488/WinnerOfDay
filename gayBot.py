@@ -21,6 +21,19 @@ except ImportError:
 VK_TOKEN = os.getenv("VK_TOKEN")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
 
+def read_int_env(name: str):
+    value = os.getenv(name)
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        print(f"WARNING: {name} is not a valid integer")
+        return None
+
+ADMIN_USER_ID = read_int_env("ADMIN_USER_ID")
+ALLOWED_PEER_ID = read_int_env("ALLOWED_PEER_ID")
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 try:
@@ -58,6 +71,7 @@ if not LLM_PROVIDER:
 
 BUILD_DATE = os.getenv("BUILD_DATE", "unknown")
 BUILD_SHA = os.getenv("BUILD_SHA", "")
+BOT_GROUP_ID = None
 
 if not VK_TOKEN:
     print("❌ ОШИБКА: Не найден VK_TOKEN!")
@@ -133,6 +147,12 @@ SYSTEM_PROMPT = (
     "Пример: {\"user_id\": 123, \"reason\": \"...\"}\n"
     "Никакого текста вне JSON.\n"
 )
+CHAT_SYSTEM_PROMPT = normalize_prompt(
+    os.getenv(
+        "CHAT_SYSTEM_PROMPT",
+        "Ты чат-бот сообщества VK. Отвечай по-русски, по делу и без JSON."
+    )
+)
 USER_PROMPT_TEMPLATE = normalize_prompt(os.getenv("USER_PROMPT_TEMPLATE"))
 
 if not USER_PROMPT_TEMPLATE:
@@ -146,6 +166,32 @@ def render_user_prompt(context_text: str) -> str:
     else:
         prompt = f"{prompt}\n\n{context_text}"
     return prompt
+
+def has_bot_mention(text: str) -> bool:
+    if not text or not BOT_GROUP_ID:
+        return False
+    group_id = str(BOT_GROUP_ID)
+    lowered = text.lower()
+    if f"@club{group_id}" in lowered or f"@public{group_id}" in lowered:
+        return True
+    return re.search(rf"\[(club|public){group_id}\|", lowered) is not None
+
+def strip_bot_mention(text: str) -> str:
+    if not text or not BOT_GROUP_ID:
+        return text
+    group_id = str(BOT_GROUP_ID)
+    cleaned = re.sub(rf"\[(club|public){group_id}\|[^\]]+\]", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(rf"@(?:club|public){group_id}\b", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+def is_message_allowed(message: Message) -> bool:
+    if ALLOWED_PEER_ID is None:
+        return True
+    if message.peer_id == ALLOWED_PEER_ID:
+        return True
+    if ADMIN_USER_ID and message.from_id == ADMIN_USER_ID and message.peer_id == message.from_id:
+        return True
+    return False
 
 
 bot = Bot(token=VK_TOKEN)
@@ -292,6 +338,8 @@ async def run_game_logic(peer_id: int, reset_if_exists: bool = False):
     reset_if_exists=True: Если игра запускается таймером, мы удаляем старый результат и выбираем заново.
     reset_if_exists=False: (По умолчанию) Если играем вручную, бот скажет 'Уже выбрали'.
     """
+    if ALLOWED_PEER_ID is not None and peer_id != ALLOWED_PEER_ID:
+        return
     today = datetime.datetime.now(MSK_TZ).date().isoformat()
     last_winner_id = None
     exclude_user_id = None
@@ -470,6 +518,8 @@ async def build_leaderboard_text(peer_id: int) -> str:
     )
 
 async def post_leaderboard(peer_id: int, month_key: str):
+    if ALLOWED_PEER_ID is not None and peer_id != ALLOWED_PEER_ID:
+        return
     try:
         text = await build_leaderboard_text(peer_id)
         await bot.api.messages.send(peer_id=peer_id, message=text, random_id=0)
@@ -492,16 +542,28 @@ async def scheduler_loop():
             month_key = now.strftime("%Y-%m")
             last_day = last_day_of_month(now.year, now.month)
             async with aiosqlite.connect(DB_NAME) as db:
-                cursor = await db.execute("SELECT peer_id FROM schedules WHERE time = ?", (now_time,))
+                if ALLOWED_PEER_ID is not None:
+                    cursor = await db.execute(
+                        "SELECT peer_id FROM schedules WHERE time = ? AND peer_id = ?",
+                        (now_time, ALLOWED_PEER_ID)
+                    )
+                else:
+                    cursor = await db.execute("SELECT peer_id FROM schedules WHERE time = ?", (now_time,))
                 rows = await cursor.fetchall()
                 if rows:
                     print(f"⏰ Triggering scheduled games for time {now_time}: {len(rows)} chats")
                     for (peer_id,) in rows:
                         asyncio.create_task(run_game_logic(peer_id))
-                cursor = await db.execute(
-                    "SELECT peer_id, day, time, last_run_month FROM leaderboard_schedule WHERE time = ?",
-                    (now_time,)
-                )
+                if ALLOWED_PEER_ID is not None:
+                    cursor = await db.execute(
+                        "SELECT peer_id, day, time, last_run_month FROM leaderboard_schedule WHERE time = ? AND peer_id = ?",
+                        (now_time, ALLOWED_PEER_ID)
+                    )
+                else:
+                    cursor = await db.execute(
+                        "SELECT peer_id, day, time, last_run_month FROM leaderboard_schedule WHERE time = ?",
+                        (now_time,)
+                    )
                 lb_rows = await cursor.fetchall()
                 if lb_rows:
                     for peer_id, day, _, last_run_month in lb_rows:
@@ -524,6 +586,8 @@ async def scheduler_loop():
 
 @bot.on.message(text=CMD_SETTINGS)
 async def show_settings(message: Message):
+    if not is_message_allowed(message):
+        return
     provider_label = "Groq" if LLM_PROVIDER == "groq" else "Venice"
     if LLM_PROVIDER == "groq":
         key_short = GROQ_API_KEY[:5] + "..." if GROQ_API_KEY else "???"
@@ -533,6 +597,13 @@ async def show_settings(message: Message):
         key_short = VENICE_API_KEY[:5] + "..." if VENICE_API_KEY else "???"
         active_model = VENICE_MODEL
         active_temperature = VENICE_TEMPERATURE
+    if ALLOWED_PEER_ID is None:
+        access_line = "без ограничений"
+    else:
+        if ADMIN_USER_ID:
+            access_line = f"чат {ALLOWED_PEER_ID}, ЛС admin {ADMIN_USER_ID}"
+        else:
+            access_line = f"чат {ALLOWED_PEER_ID}, ЛС admin не настроены"
     schedule_time = None
     leaderboard_day = None
     leaderboard_time = None
@@ -557,6 +628,8 @@ async def show_settings(message: Message):
         f"🎛 **Настройки игры**\n\n"
         f"🤖 **Провайдер:** `{provider_label}`\n"
         f"📦 **Доступные провайдеры:** `groq`, `venice`\n"
+        f"🔒 **Доступ:** {access_line}\n"
+        f"🧭 **Peer ID:** `{message.peer_id}`\n"
         f"🎯 **Модель:** `{active_model}`\n"
         f"🔑 **Ключ:** `{key_short}`\n"
         f"🌡 **Температура:** `{active_temperature}`\n"
@@ -579,8 +652,10 @@ async def show_settings(message: Message):
         f"• `{CMD_LEADERBOARD_TIMER_RESET}` - Сброс таймера лидерборда"
     )
     await message.answer(text)
-@bot.on.message(text=CMD_LIST_MODELS)
+@bot.on.message(StartswithRule(CMD_LIST_MODELS))
 async def list_models_handler(message: Message):
+    if not is_message_allowed(message):
+        return
     args = message.text.replace(CMD_LIST_MODELS, "").strip().lower()
     if not args:
         await message.answer(f"❌ Укажи провайдера: groq или venice.\nПример: `{CMD_LIST_MODELS} groq`")
@@ -642,11 +717,15 @@ async def list_models_handler(message: Message):
 # ОБРАБОТЧИКИ С НОВЫМ ПРАВИЛОМ
 @bot.on.message(text=CMD_LEADERBOARD)
 async def leaderboard_handler(message: Message):
+    if not is_message_allowed(message):
+        return
     text = await build_leaderboard_text(message.peer_id)
     await message.answer(text)
 
 @bot.on.message(StartswithRule(CMD_SET_MODEL))
 async def set_model_handler(message: Message):
+    if not is_message_allowed(message):
+        return
     global GROQ_MODEL, VENICE_MODEL
     args = message.text.replace(CMD_SET_MODEL, "").strip()
     if not args:
@@ -663,6 +742,8 @@ async def set_model_handler(message: Message):
 
 @bot.on.message(StartswithRule(CMD_SET_PROVIDER))
 async def set_provider_handler(message: Message):
+    if not is_message_allowed(message):
+        return
     global LLM_PROVIDER, groq_client
     args = message.text.replace(CMD_SET_PROVIDER, "").strip().lower()
     if not args:
@@ -690,6 +771,8 @@ async def set_provider_handler(message: Message):
 
 @bot.on.message(StartswithRule(CMD_SET_KEY))
 async def set_key_handler(message: Message):
+    if not is_message_allowed(message):
+        return
     global GROQ_API_KEY, VENICE_API_KEY, groq_client
     args = message.text.replace(CMD_SET_KEY, "").strip()
     if not args:
@@ -723,6 +806,8 @@ async def set_key_handler(message: Message):
 
 @bot.on.message(StartswithRule(CMD_SET_TEMPERATURE))
 async def set_temperature_handler(message: Message):
+    if not is_message_allowed(message):
+        return
     global GROQ_TEMPERATURE, VENICE_TEMPERATURE
     args = message.text.replace(CMD_SET_TEMPERATURE, "").strip()
     if not args:
@@ -747,6 +832,8 @@ async def set_temperature_handler(message: Message):
 
 @bot.on.message(text=CMD_RESET)
 async def reset_daily_game(message: Message):
+    if not is_message_allowed(message):
+        return
     peer_id = message.peer_id
     today = datetime.datetime.now(MSK_TZ).date().isoformat()
     async with aiosqlite.connect(DB_NAME) as db:
@@ -756,10 +843,14 @@ async def reset_daily_game(message: Message):
 
 @bot.on.message(text=CMD_RUN)
 async def trigger_game(message: Message):
+    if not is_message_allowed(message):
+        return
     await run_game_logic(message.peer_id)
 
 @bot.on.message(StartswithRule(CMD_TIME_SET))
 async def set_schedule(message: Message):
+    if not is_message_allowed(message):
+        return
     try:
         args = message.text.replace(CMD_TIME_SET, "").strip()
         datetime.datetime.strptime(args, "%H:%M")
@@ -777,6 +868,8 @@ async def set_schedule(message: Message):
 
 @bot.on.message(text=CMD_TIME_RESET)
 async def unset_schedule(message: Message):
+    if not is_message_allowed(message):
+        return
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM schedules WHERE peer_id = ?", (message.peer_id,))
         await db.commit()
@@ -784,6 +877,8 @@ async def unset_schedule(message: Message):
 
 @bot.on.message(StartswithRule(CMD_LEADERBOARD_TIMER_SET))
 async def set_leaderboard_timer(message: Message):
+    if not is_message_allowed(message):
+        return
     args = message.text.replace(CMD_LEADERBOARD_TIMER_SET, "").strip()
     match = re.match(r"^(\d{1,2})-(\d{1,2})-(\d{1,2})$", args)
     if not match:
@@ -806,13 +901,45 @@ async def set_leaderboard_timer(message: Message):
 
 @bot.on.message(text=CMD_LEADERBOARD_TIMER_RESET)
 async def reset_leaderboard_timer(message: Message):
+    if not is_message_allowed(message):
+        return
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM leaderboard_schedule WHERE peer_id = ?", (message.peer_id,))
         await db.commit()
     await message.answer("✅ Таймер лидерборда сброшен.")
 
 @bot.on.message()
+async def mention_reply_handler(message: Message):
+    if not is_message_allowed(message):
+        return
+    if not message.text:
+        return
+    if message.text.startswith("/"):
+        return
+    is_admin_dm = (
+        ADMIN_USER_ID
+        and message.from_id == ADMIN_USER_ID
+        and message.peer_id == message.from_id
+    )
+    if not is_admin_dm and not has_bot_mention(message.text):
+        return
+    cleaned = message.text if is_admin_dm else strip_bot_mention(message.text)
+    if not cleaned:
+        await message.answer("Напиши сообщение после упоминания.")
+        return
+    if cleaned.startswith("/"):
+        return
+    try:
+        response_text = await fetch_llm_content(CHAT_SYSTEM_PROMPT, cleaned)
+        await message.answer(response_text)
+    except Exception as e:
+        print(f"ERROR: Mention reply failed: {e}")
+        await message.answer("❌ Ошибка ответа. Попробуй позже.")
+
+@bot.on.message()
 async def logger(message: Message):
+    if not is_message_allowed(message):
+        return
     if message.text and not message.text.startswith("/"):
         try:
             user_info = await message.get_user()
@@ -828,6 +955,13 @@ async def logger(message: Message):
 
 async def start_background_tasks():
     await init_db()
+    global BOT_GROUP_ID
+    try:
+        groups = await bot.api.groups.get_by_id()
+        if groups:
+            BOT_GROUP_ID = groups[0].id
+    except Exception as e:
+        print(f"ERROR: Failed to load group id: {e}")
     asyncio.create_task(scheduler_loop())
 
 if __name__ == "__main__":
