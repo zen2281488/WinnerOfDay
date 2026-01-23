@@ -292,6 +292,22 @@ async def fetch_llm_content(system_prompt: str, user_prompt: str) -> str:
 async def choose_winner_via_llm(chat_log: list, excluded_user_id=None) -> dict:
     context_lines = []
     available_ids = set()
+    alias_map = {}
+    alias_names = {}
+    alias_to_user_id = {}
+    alias_order = []
+    alias_counter = 0
+
+    def get_alias(uid: int, safe_name: str) -> str:
+        nonlocal alias_counter
+        if uid not in alias_map:
+            alias_counter += 1
+            alias = f"U{alias_counter}"
+            alias_map[uid] = alias
+            alias_names[alias] = safe_name
+            alias_to_user_id[alias] = uid
+            alias_order.append(alias)
+        return alias_map[uid]
     
     for uid, text, name in chat_log:
         if excluded_user_id is not None and uid == excluded_user_id:
@@ -299,13 +315,19 @@ async def choose_winner_via_llm(chat_log: list, excluded_user_id=None) -> dict:
         if len(text.strip()) < 3:
             continue
         safe_name = name if name else "Unknown"
-        context_lines.append(f"[{uid}] {safe_name}: {text}")
+        alias = get_alias(uid, safe_name)
+        context_lines.append(f"{alias}: {text}")
         available_ids.add(uid)
 
     if not context_lines:
         return {"user_id": 0, "reason": "Все молчат. Скучные натуралы."}
 
-    context_text = "\n".join(context_lines)
+    alias_parts = [
+        f"{alias}={alias_to_user_id[alias]}|{alias_names[alias]}"
+        for alias in alias_order
+    ]
+    alias_map_line = "USERS: " + "; ".join(alias_parts)
+    context_text = f"{alias_map_line}\n" + "\n".join(context_lines)
 
     user_prompt = render_user_prompt(context_text)
 
@@ -326,7 +348,19 @@ async def choose_winner_via_llm(chat_log: list, excluded_user_id=None) -> dict:
         if not isinstance(result, dict):
             raise ValueError("Result is not a dictionary")
             
-        user_id = int(result.get('user_id', 0))
+        user_id_raw = result.get("user_id", 0)
+        user_id = None
+        if isinstance(user_id_raw, str):
+            raw = user_id_raw.strip()
+            if raw:
+                alias_key = raw.upper()
+                if alias_key in alias_to_user_id:
+                    user_id = alias_to_user_id[alias_key]
+                elif raw.isdigit():
+                    user_id = int(raw)
+        elif isinstance(user_id_raw, (int, float)):
+            user_id = int(user_id_raw)
+
         if user_id not in available_ids:
             result['user_id'] = random.choice(list(available_ids))
         else:
@@ -409,16 +443,37 @@ async def run_game_logic(peer_id: int, reset_if_exists: bool = False):
             if row:
                 last_winner_id = row[0]
 
+        now_msk = datetime.datetime.now(MSK_TZ)
+        day_start = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + datetime.timedelta(days=1)
+        start_ts = int(day_start.timestamp())
+        end_ts = int(day_end.timestamp())
+
         cursor = await db.execute("""
             SELECT user_id, text, username 
             FROM messages 
             WHERE peer_id = ? 
+            AND timestamp >= ? AND timestamp < ?
             AND LENGTH(TRIM(text)) > 2
             ORDER BY timestamp DESC 
             LIMIT 200
-        """, (peer_id,))
+        """, (peer_id, start_ts, end_ts))
         rows = await cursor.fetchall()
-        
+
+        soft_min_messages = 50
+        if len(rows) < soft_min_messages:
+            remaining = soft_min_messages - len(rows)
+            cursor = await db.execute("""
+                SELECT user_id, text, username 
+                FROM messages 
+                WHERE peer_id = ? 
+                AND timestamp < ?
+                AND LENGTH(TRIM(text)) > 2
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            """, (peer_id, start_ts, remaining))
+            rows.extend(await cursor.fetchall())
+
         if len(rows) < 3:
             await send_msg("Мало сообщений. Пишите больше, чтобы я мог выбрать худшего.")
             return
