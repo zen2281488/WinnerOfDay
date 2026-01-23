@@ -61,6 +61,30 @@ if CHAT_MESSAGE_MAX_CHARS is None:
 if CHAT_MESSAGE_MAX_CHARS < 0:
     CHAT_MESSAGE_MAX_CHARS = 0
 
+BOT_REPLY_FULL_LIMIT = read_int_env("CHAT_BOT_FULL_LIMIT")
+if BOT_REPLY_FULL_LIMIT is None:
+    BOT_REPLY_FULL_LIMIT = 2
+if BOT_REPLY_FULL_LIMIT < 0:
+    BOT_REPLY_FULL_LIMIT = 0
+
+BOT_REPLY_SHORT_LIMIT = read_int_env("CHAT_BOT_SHORT_LIMIT")
+if BOT_REPLY_SHORT_LIMIT is None:
+    BOT_REPLY_SHORT_LIMIT = 2
+if BOT_REPLY_SHORT_LIMIT < 0:
+    BOT_REPLY_SHORT_LIMIT = 0
+
+BOT_REPLY_FULL_MAX_CHARS = read_int_env("CHAT_BOT_FULL_MAX_CHARS")
+if BOT_REPLY_FULL_MAX_CHARS is None:
+    BOT_REPLY_FULL_MAX_CHARS = 800
+if BOT_REPLY_FULL_MAX_CHARS < 0:
+    BOT_REPLY_FULL_MAX_CHARS = 0
+
+BOT_REPLY_SHORT_MAX_CHARS = read_int_env("CHAT_BOT_SHORT_MAX_CHARS")
+if BOT_REPLY_SHORT_MAX_CHARS is None:
+    BOT_REPLY_SHORT_MAX_CHARS = 160
+if BOT_REPLY_SHORT_MAX_CHARS < 0:
+    BOT_REPLY_SHORT_MAX_CHARS = 0
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 try:
@@ -211,15 +235,89 @@ def strip_bot_mention(text: str) -> str:
     cleaned = re.sub(rf"@(?:club|public){group_id}\b", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
 
-def trim_chat_text(text: str) -> str:
+def trim_text(text: str, max_chars: int) -> str:
     if not text:
         return ""
-    if CHAT_MESSAGE_MAX_CHARS <= 0:
-        return text.strip()
     cleaned = text.strip()
-    if len(cleaned) > CHAT_MESSAGE_MAX_CHARS:
-        return cleaned[:CHAT_MESSAGE_MAX_CHARS].rstrip()
+    if max_chars <= 0:
+        return cleaned
+    if len(cleaned) > max_chars:
+        return cleaned[:max_chars].rstrip()
     return cleaned
+
+def trim_chat_text(text: str) -> str:
+    return trim_text(text, CHAT_MESSAGE_MAX_CHARS)
+
+def extract_reply_text(message: Message) -> str:
+    reply_message = getattr(message, "reply_message", None)
+    if not reply_message:
+        return ""
+    reply_text = getattr(reply_message, "text", None)
+    if reply_text is None and isinstance(reply_message, dict):
+        reply_text = reply_message.get("text")
+    return str(reply_text) if reply_text else ""
+
+def extract_reply_from_id(message: Message):
+    reply_message = getattr(message, "reply_message", None)
+    if not reply_message:
+        return None
+    reply_from_id = getattr(reply_message, "from_id", None)
+    if reply_from_id is None and isinstance(reply_message, dict):
+        reply_from_id = reply_message.get("from_id")
+    return reply_from_id
+
+async def build_chat_history(peer_id: int, user_id: int) -> list:
+    history = []
+    bot_limit = BOT_REPLY_FULL_LIMIT + BOT_REPLY_SHORT_LIMIT
+    if CHAT_HISTORY_LIMIT <= 0 and bot_limit <= 0:
+        return history
+
+    user_rows = []
+    bot_rows = []
+    async with aiosqlite.connect(DB_NAME) as db:
+        if CHAT_HISTORY_LIMIT > 0:
+            cursor = await db.execute(
+                """
+                SELECT id, text, timestamp
+                FROM bot_dialogs
+                WHERE peer_id = ? AND user_id = ? AND role = 'user'
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+                """,
+                (peer_id, user_id, CHAT_HISTORY_LIMIT),
+            )
+            user_rows = await cursor.fetchall()
+        if bot_limit > 0:
+            cursor = await db.execute(
+                """
+                SELECT id, text, timestamp
+                FROM bot_dialogs
+                WHERE peer_id = ? AND user_id = ? AND role = 'assistant'
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+                """,
+                (peer_id, user_id, bot_limit),
+            )
+            bot_rows = await cursor.fetchall()
+
+    entries = []
+    for entry_id, text, ts in user_rows:
+        content = trim_chat_text(text)
+        if content:
+            entries.append((ts, entry_id, "user", content))
+
+    for idx, (entry_id, text, ts) in enumerate(bot_rows):
+        if idx < BOT_REPLY_FULL_LIMIT:
+            content = trim_text(text, BOT_REPLY_FULL_MAX_CHARS)
+        else:
+            content = trim_text(text, BOT_REPLY_SHORT_MAX_CHARS)
+        if content:
+            entries.append((ts, entry_id, "assistant", content))
+
+    entries.sort(key=lambda item: (item[0], item[1]))
+    for _, _, role, content in entries:
+        history.append({"role": role, "content": content})
+    return history
 
 def extract_group_id(group_response):
     if not group_response:
@@ -1046,12 +1144,14 @@ async def mention_reply_handler(message: Message):
         return
     if message.text.startswith("/"):
         return
+    reply_from_id = extract_reply_from_id(message)
+    is_reply_to_bot = BOT_GROUP_ID and reply_from_id == -BOT_GROUP_ID
     is_admin_dm = (
         ADMIN_USER_ID
         and message.from_id == ADMIN_USER_ID
         and message.peer_id == message.from_id
     )
-    if not is_admin_dm and not has_bot_mention(message.text):
+    if not is_admin_dm and not has_bot_mention(message.text) and not is_reply_to_bot:
         return
     cleaned = message.text if is_admin_dm else strip_bot_mention(message.text)
     if not cleaned:
@@ -1064,45 +1164,30 @@ async def mention_reply_handler(message: Message):
         if not cleaned_for_llm:
             await message.answer("Напиши сообщение после упоминания.")
             return
-        reply_message = getattr(message, "reply_message", None)
-        reply_text = None
-        if reply_message:
-            reply_text = getattr(reply_message, "text", None)
-            if reply_text is None and isinstance(reply_message, dict):
-                reply_text = reply_message.get("text")
+        reply_text = extract_reply_text(message)
         if reply_text:
-            reply_text = trim_chat_text(str(reply_text))
+            reply_text = trim_chat_text(reply_text)
             if reply_text:
                 cleaned_for_llm = f"Контекст реплая: {reply_text}\n\n{cleaned_for_llm}"
-        history_messages = []
-        if CHAT_HISTORY_LIMIT > 0:
-            async with aiosqlite.connect(DB_NAME) as db:
-                cursor = await db.execute(
-                    """
-                    SELECT text
-                    FROM bot_dialogs
-                    WHERE peer_id = ? AND user_id = ? AND role = 'user'
-                    ORDER BY timestamp DESC, id DESC
-                    LIMIT ?
-                    """,
-                    (message.peer_id, message.from_id, CHAT_HISTORY_LIMIT),
-                )
-                rows = await cursor.fetchall()
-            for (text,) in reversed(rows):
-                if not text:
-                    continue
-                history_messages.append({"role": "user", "content": trim_chat_text(text)})
+        history_messages = await build_chat_history(message.peer_id, message.from_id)
 
         chat_messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
         chat_messages.extend(history_messages)
         chat_messages.append({"role": "user", "content": cleaned_for_llm})
         response_text = await fetch_llm_messages(chat_messages)
         await message.answer(response_text)
+        response_for_store = trim_text(response_text, BOT_REPLY_FULL_MAX_CHARS)
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute(
                 "INSERT INTO bot_dialogs (peer_id, user_id, role, text, timestamp) VALUES (?, ?, ?, ?, ?)",
                 (message.peer_id, message.from_id, "user", trim_chat_text(cleaned), message.date),
             )
+            if response_for_store:
+                now_ts = int(datetime.datetime.now(MSK_TZ).timestamp())
+                await db.execute(
+                    "INSERT INTO bot_dialogs (peer_id, user_id, role, text, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (message.peer_id, message.from_id, "assistant", response_for_store, now_ts),
+                )
             await db.commit()
     except Exception as e:
         print(f"ERROR: Mention reply failed: {e}")
