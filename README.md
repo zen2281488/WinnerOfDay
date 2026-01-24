@@ -1,5 +1,5 @@
 <p align="center">
-  <img alt="Winner of Day Bot" src="https://img.shields.io/badge/Winner%20of%20Day%20Bot-Production-111827.png?style=for-the-badge&logo=vk&logoColor=white">
+  <img alt="Winner of Day Bot" src="https://img.shields.io/badge/Winner%20of%20Day%20Bot-111827.png?style=for-the-badge&logo=vk&logoColor=white" width="100%">
 </p>
 
 ![License](https://img.shields.io/badge/License-MIT-green)
