@@ -192,6 +192,28 @@ class EqualsRule(ABCRule[Message]):
     async def check(self, event: Message) -> bool:
         return (event.text or "").strip().lower() == self.text
 
+
+def is_chatbot_trigger_message(message: Message) -> bool:
+    text = message.text
+    if not text:
+        return False
+    if text.lstrip().startswith("/"):
+        return False
+    reply_from_id = extract_reply_from_id(message)
+    is_reply_to_bot = bool(BOT_GROUP_ID and reply_from_id == -BOT_GROUP_ID)
+    is_admin_dm = bool(
+        ADMIN_USER_ID
+        and message.from_id == ADMIN_USER_ID
+        and message.peer_id == message.from_id
+    )
+    is_mention = has_bot_mention(text)
+    return is_admin_dm or is_mention or is_reply_to_bot
+
+
+class ChatbotTriggerRule(ABCRule[Message]):
+    async def check(self, event: Message) -> bool:
+        return is_chatbot_trigger_message(event)
+
 # Промпт
 def normalize_prompt(value: str) -> str:
     if not value:
@@ -1330,23 +1352,16 @@ async def reset_leaderboard_timer(message: Message):
     log.info("Leaderboard timer reset peer_id=%s user_id=%s", message.peer_id, message.from_id)
     await send_reply(message, "✅ Таймер лидерборда сброшен.")
 
-@bot.on.message()
+@bot.on.message(ChatbotTriggerRule())
 async def mention_reply_handler(message: Message):
     if not message.text:
         return
     text = message.text
-    if text.lstrip().startswith("/"):
-        return
-    reply_from_id = extract_reply_from_id(message)
-    is_reply_to_bot = BOT_GROUP_ID and reply_from_id == -BOT_GROUP_ID
-    is_admin_dm = (
+    is_admin_dm = bool(
         ADMIN_USER_ID
         and message.from_id == ADMIN_USER_ID
         and message.peer_id == message.from_id
     )
-    is_mention = has_bot_mention(text)
-    if not is_admin_dm and not is_mention and not is_reply_to_bot:
-        return
     if not await ensure_message_allowed(message, action_label="чатботу"):
         return
     if not CHATBOT_ENABLED:
