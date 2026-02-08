@@ -78,8 +78,8 @@ ADMIN_USER_ID=123456789
 
 ### Игра и данные
 ```
-GAME_TITLE=Пидор дня
-LEADERBOARD_TITLE=📊 Пидерборд
+GAME_TITLE=Лидер дня
+LEADERBOARD_TITLE=📊 Лидерборд
 DB_PATH=./data/chat_history.db
 ```
 
