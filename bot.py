@@ -116,9 +116,24 @@ if not LLM_PROVIDER:
     else:
         LLM_PROVIDER = "groq"
 
+CHAT_LLM_PROVIDER = os.getenv("CHAT_LLM_PROVIDER", "").strip().lower()
+if not CHAT_LLM_PROVIDER:
+    CHAT_LLM_PROVIDER = LLM_PROVIDER
+
+CHAT_GROQ_MODEL = os.getenv("CHAT_GROQ_MODEL", GROQ_MODEL)
+CHAT_GROQ_TEMPERATURE = read_float_env("CHAT_GROQ_TEMPERATURE", default=GROQ_TEMPERATURE)
+if CHAT_GROQ_TEMPERATURE is None:
+    CHAT_GROQ_TEMPERATURE = GROQ_TEMPERATURE
+
+CHAT_VENICE_MODEL = os.getenv("CHAT_VENICE_MODEL", VENICE_MODEL)
+CHAT_VENICE_TEMPERATURE = read_float_env("CHAT_VENICE_TEMPERATURE", default=VENICE_TEMPERATURE)
+if CHAT_VENICE_TEMPERATURE is None:
+    CHAT_VENICE_TEMPERATURE = VENICE_TEMPERATURE
+
 BUILD_DATE = os.getenv("BUILD_DATE", "unknown")
 BUILD_SHA = os.getenv("BUILD_SHA", "")
 BOT_GROUP_ID = None
+USER_NAME_CACHE: dict[int, str] = {}
 
 if not VK_TOKEN:
     log.error("VK_TOKEN is missing")
@@ -126,6 +141,10 @@ if not VK_TOKEN:
 
 if LLM_PROVIDER not in ("groq", "venice"):
     log.error("LLM_PROVIDER must be groq or venice")
+    sys.exit(1)
+
+if CHAT_LLM_PROVIDER not in ("groq", "venice"):
+    log.error("CHAT_LLM_PROVIDER must be groq or venice")
     sys.exit(1)
 
 if LLM_PROVIDER == "groq":
@@ -139,6 +158,19 @@ else:
     if not VENICE_API_KEY:
         log.error("VENICE_API_KEY is missing while LLM_PROVIDER=venice")
         sys.exit(1)
+
+if CHATBOT_ENABLED:
+    if CHAT_LLM_PROVIDER == "groq":
+        if not GROQ_API_KEY:
+            log.error("GROQ_API_KEY is missing while CHAT_LLM_PROVIDER=groq")
+            sys.exit(1)
+        if AsyncGroq is None:
+            log.error("groq package is not installed but CHAT_LLM_PROVIDER=groq")
+            sys.exit(1)
+    else:
+        if not VENICE_API_KEY:
+            log.error("VENICE_API_KEY is missing while CHAT_LLM_PROVIDER=venice")
+            sys.exit(1)
 
 # === Команды ===
 GAME_TITLE = os.getenv("GAME_TITLE", "Пидор дня")
@@ -227,6 +259,16 @@ def strip_command(text: str, command: str) -> str:
     if trimmed.lower().startswith(command.lower()):
         return trimmed[len(command):].strip()
     return trimmed
+
+def parse_llm_scope(value: str) -> str | None:
+    if not value:
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("chat", "чат"):
+        return "chat"
+    if normalized in ("game", "игра"):
+        return "game"
+    return None
 
 SYSTEM_PROMPT = (
     "Формат ответа — строго валидный JSON, только объект и только двойные кавычки. "
@@ -414,6 +456,7 @@ async def ensure_message_allowed(message: Message, action_label: str | None = No
     return False
 
 async def ensure_command_allowed(message: Message, command: str) -> bool:
+    asyncio.create_task(store_message(message))
     return await ensure_message_allowed(message, action_label=f"команде `{command}`")
 
 def get_reply_to_id(message: Message):
@@ -443,9 +486,43 @@ async def send_reply(message: Message, text: str, **kwargs):
                 return
         log.exception("send_reply failed: %s", e)
 
+def get_conversation_message_id(message: Message) -> int | None:
+    value = getattr(message, "conversation_message_id", None)
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+async def store_message(message: Message):
+    try:
+        if not is_message_allowed(message):
+            return
+        if message.from_id is None or message.from_id <= 0:
+            return
+        text = getattr(message, "text", None)
+        if text is None:
+            return
+        username = USER_NAME_CACHE.get(message.from_id)
+        if not username:
+            try:
+                user_info = await message.get_user()
+                username = f"{user_info.first_name} {user_info.last_name}"
+            except Exception as e:
+                log.debug("Failed to resolve username user_id=%s: %s", message.from_id, e)
+                username = "Unknown"
+            USER_NAME_CACHE[message.from_id] = username
+        conversation_message_id = get_conversation_message_id(message)
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO messages (user_id, peer_id, text, timestamp, username, conversation_message_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (message.from_id, message.peer_id, text, message.date, username, conversation_message_id),
+            )
+            await db.commit()
+    except Exception as e:
+        log.exception("Failed to store message peer_id=%s user_id=%s: %s", message.peer_id, message.from_id, e)
+
 
 bot = Bot(token=VK_TOKEN)
-groq_client = AsyncGroq(api_key=GROQ_API_KEY) if LLM_PROVIDER == "groq" and AsyncGroq else None
+groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY and AsyncGroq else None
 
 def build_venice_headers() -> dict:
     return {"Authorization": f"Bearer {VENICE_API_KEY}"}
@@ -467,6 +544,14 @@ async def venice_request(method: str, path: str, **kwargs) -> httpx.Response:
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS messages (user_id INTEGER, peer_id INTEGER, text TEXT, timestamp INTEGER, username TEXT)")
+        cursor = await db.execute("PRAGMA table_info(messages)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "conversation_message_id" not in columns:
+            await db.execute("ALTER TABLE messages ADD COLUMN conversation_message_id INTEGER")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_peer_time ON messages (peer_id, timestamp)")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_peer_conversation_id ON messages (peer_id, conversation_message_id)"
+        )
         await db.execute("CREATE TABLE IF NOT EXISTS bot_dialogs (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_id INTEGER, user_id INTEGER, role TEXT, text TEXT, timestamp INTEGER)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_bot_dialogs_peer_user_time ON bot_dialogs (peer_id, user_id, timestamp)")
         await db.execute("CREATE TABLE IF NOT EXISTS daily_game (peer_id INTEGER, date TEXT, winner_id INTEGER, reason TEXT, PRIMARY KEY (peer_id, date))")
@@ -476,14 +561,31 @@ async def init_db():
         await db.commit()
 
 # ================= LLM ЗАПРОСЫ =================
-async def fetch_llm_messages(messages: list, max_tokens: int = None) -> str:
+def get_llm_settings(target: str) -> tuple[str, str, float, str, float]:
+    if target == "chat":
+        return (
+            CHAT_LLM_PROVIDER,
+            CHAT_GROQ_MODEL,
+            CHAT_GROQ_TEMPERATURE,
+            CHAT_VENICE_MODEL,
+            CHAT_VENICE_TEMPERATURE,
+        )
+    return (LLM_PROVIDER, GROQ_MODEL, GROQ_TEMPERATURE, VENICE_MODEL, VENICE_TEMPERATURE)
+
+async def fetch_llm_messages(messages: list, max_tokens: int = None, *, target: str = "game") -> str:
+    provider, groq_model, groq_temperature, venice_model, venice_temperature = get_llm_settings(target)
     max_tokens = normalize_max_tokens(max_tokens, LLM_MAX_TOKENS)
-    if LLM_PROVIDER == "venice":
-        log.debug("Sending request to Venice. Model=%s Temp=%s", VENICE_MODEL, VENICE_TEMPERATURE)
+    if provider == "venice":
+        log.debug(
+            "Sending request to Venice. Target=%s Model=%s Temp=%s",
+            target,
+            venice_model,
+            venice_temperature,
+        )
         payload = {
-            "model": VENICE_MODEL,
+            "model": venice_model,
             "messages": messages,
-            "temperature": VENICE_TEMPERATURE,
+            "temperature": venice_temperature,
             "max_tokens": max_tokens,
             "venice_parameters": {
                 "include_venice_system_prompt": VENICE_INCLUDE_SYSTEM_PROMPT,
@@ -500,13 +602,20 @@ async def fetch_llm_messages(messages: list, max_tokens: int = None) -> str:
             raise ValueError("Empty content in Venice response")
         return content
 
+    if provider != "groq":
+        raise ValueError(f"Unsupported LLM provider: {provider}")
     if not groq_client:
         raise RuntimeError("Groq client is not initialized")
-    log.debug("Sending request to Groq. Model=%s Temp=%s", GROQ_MODEL, GROQ_TEMPERATURE)
+    log.debug(
+        "Sending request to Groq. Target=%s Model=%s Temp=%s",
+        target,
+        groq_model,
+        groq_temperature,
+    )
     completion = await groq_client.chat.completions.create(
-        model=GROQ_MODEL,
+        model=groq_model,
         messages=messages,
-        temperature=GROQ_TEMPERATURE,
+        temperature=groq_temperature,
         max_tokens=max_tokens,
     )
     content = completion.choices[0].message.content
@@ -514,12 +623,12 @@ async def fetch_llm_messages(messages: list, max_tokens: int = None) -> str:
         raise ValueError("Empty content in Groq response")
     return content
 
-async def fetch_llm_content(system_prompt: str, user_prompt: str) -> str:
+async def fetch_llm_content(system_prompt: str, user_prompt: str, *, target: str = "game") -> str:
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    return await fetch_llm_messages(messages)
+    return await fetch_llm_messages(messages, target=target)
 
 
 async def choose_winner_via_llm(chat_log: list, excluded_user_id=None) -> dict:
@@ -929,15 +1038,27 @@ async def show_settings(message: Message):
     if not await ensure_command_allowed(message, CMD_SETTINGS):
         return
     log.debug("Settings requested peer_id=%s user_id=%s", message.peer_id, message.from_id)
-    provider_label = "Groq" if LLM_PROVIDER == "groq" else "Venice"
     if LLM_PROVIDER == "groq":
-        key_short = GROQ_API_KEY[:5] + "..." if GROQ_API_KEY else "не задан"
-        active_model = GROQ_MODEL
-        active_temperature = GROQ_TEMPERATURE
+        game_provider_label = "Groq"
+        game_key_short = GROQ_API_KEY[:5] + "..." if GROQ_API_KEY else "не задан"
+        game_model = GROQ_MODEL
+        game_temperature = GROQ_TEMPERATURE
     else:
-        key_short = VENICE_API_KEY[:5] + "..." if VENICE_API_KEY else "не задан"
-        active_model = VENICE_MODEL
-        active_temperature = VENICE_TEMPERATURE
+        game_provider_label = "Venice"
+        game_key_short = VENICE_API_KEY[:5] + "..." if VENICE_API_KEY else "не задан"
+        game_model = VENICE_MODEL
+        game_temperature = VENICE_TEMPERATURE
+
+    if CHAT_LLM_PROVIDER == "groq":
+        chat_provider_label = "Groq"
+        chat_key_short = GROQ_API_KEY[:5] + "..." if GROQ_API_KEY else "не задан"
+        chat_model = CHAT_GROQ_MODEL
+        chat_temperature = CHAT_GROQ_TEMPERATURE
+    else:
+        chat_provider_label = "Venice"
+        chat_key_short = VENICE_API_KEY[:5] + "..." if VENICE_API_KEY else "не задан"
+        chat_model = CHAT_VENICE_MODEL
+        chat_temperature = CHAT_VENICE_TEMPERATURE
     if ALLOWED_PEER_IDS is None:
         access_line = "без ограничений"
     else:
@@ -971,23 +1092,27 @@ async def show_settings(message: Message):
     else:
         leaderboard_line = "Лидерборд (МСК): не установлен\n"
     text = (
-        f"🎛 **Настройки игры**\n\n"
-        f"🤖 **Провайдер:** `{provider_label}`\n"
-        f"📦 **Доступные провайдеры:** `groq`, `venice`\n"
+        f"🎛 **Настройки бота**\n\n"
+        f"🎮 **Игра LLM:** `{game_provider_label}`\n"
+        f"• модель: `{game_model}`\n"
+        f"• температура: `{game_temperature}`\n"
+        f"• ключ: `{game_key_short}`\n\n"
+        f"💬 **Чатбот LLM:** `{chat_provider_label}`\n"
+        f"• модель: `{chat_model}`\n"
+        f"• температура: `{chat_temperature}`\n"
+        f"• ключ: `{chat_key_short}`\n\n"
+        f"📦 **Провайдеры:** `groq`, `venice`\n"
         f"🔒 **Доступ:** {access_line}\n"
         f"🧭 **Peer ID:** `{message.peer_id}`\n"
         f"💬 **Чатбот:** `{chatbot_status}`\n"
-        f"🎯 **Модель:** `{active_model}`\n"
-        f"🔑 **Ключ:** `{key_short}`\n"
-        f"🌡 **Температура:** `{active_temperature}`\n"
         f"Последнее обновление: {format_build_date(BUILD_DATE)}\n"
         f"{schedule_line}\n"
         f"{leaderboard_line}\n"
         f"**⚙ Команды:**\n"
-        f"• `{CMD_SET_PROVIDER} groq|venice` - Выбрать провайдера\n"
-        f"• `{CMD_SET_MODEL} <провайдер> <id>` - Сменить модель\n"
+        f"• `{CMD_SET_PROVIDER} [chat|game] groq|venice` - Выбрать провайдера\n"
+        f"• `{CMD_SET_MODEL} [chat|game] <провайдер> <id>` - Сменить модель\n"
         f"• `{CMD_SET_KEY} <провайдер> <ключ>` - Новый API ключ\n"
-        f"• `{CMD_SET_TEMPERATURE} <0.0-2.0>` - Установить температуру\n"
+        f"• `{CMD_SET_TEMPERATURE} [chat|game] <0.0-2.0>` - Установить температуру\n"
         f"• `{CMD_LIST_MODELS} <провайдер>` - Список моделей (Live)\n\n"
         f"• `{CMD_PROMPT}` или `{CMD_PROMPT} <текст>` - Показать/обновить user prompt\n\n"
         f"**🎮 Игра:**\n"
@@ -1107,74 +1232,128 @@ async def leaderboard_handler(message: Message):
 async def set_model_handler(message: Message):
     if not await ensure_command_allowed(message, CMD_SET_MODEL):
         return
-    global GROQ_MODEL, VENICE_MODEL
+    global GROQ_MODEL, VENICE_MODEL, CHAT_GROQ_MODEL, CHAT_VENICE_MODEL
     args = strip_command(message.text, CMD_SET_MODEL)
     if not args:
         await send_reply(message, f"❌ Укажи провайдера и модель!\nПример: `{CMD_SET_MODEL} groq llama-3.3-70b-versatile`")
         return
-    parts = args.split(maxsplit=1)
-    if len(parts) < 2:
-        await send_reply(message, f"❌ Укажи провайдера и модель!\nПример: `{CMD_SET_MODEL} venice venice-uncensored`")
-        return
-    provider, model_id = parts[0].lower(), parts[1].strip()
+    parts = args.split(maxsplit=2)
+    scope = parse_llm_scope(parts[0]) if parts else None
+    if scope:
+        if len(parts) < 3:
+            await send_reply(
+                message,
+                f"❌ Укажи зону (chat|game), провайдера и модель!\nПример: `{CMD_SET_MODEL} chat venice openai-gpt-oss-120b`",
+            )
+            return
+        provider, model_id = parts[1].lower(), parts[2].strip()
+    else:
+        scope = "game"
+        if len(parts) < 2:
+            await send_reply(message, f"❌ Укажи провайдера и модель!\nПример: `{CMD_SET_MODEL} venice venice-uncensored`")
+            return
+        provider, model_id = parts[0].lower(), parts[1].strip()
     if provider not in ("groq", "venice"):
         await send_reply(message, "❌ Неверный провайдер. Доступно: groq или venice.")
         return
     if provider == "groq":
+        if scope == "chat":
+            CHAT_GROQ_MODEL = model_id
+            os.environ["CHAT_GROQ_MODEL"] = model_id
+            log.info(
+                "Chat Groq model updated peer_id=%s user_id=%s model=%s",
+                message.peer_id,
+                message.from_id,
+                CHAT_GROQ_MODEL,
+            )
+            await send_reply(message, f"✅ Модель Groq (чатбот) изменена на: `{CHAT_GROQ_MODEL}`")
+            return
         GROQ_MODEL = model_id
         os.environ["GROQ_MODEL"] = model_id
         log.info(
-            "Groq model updated peer_id=%s user_id=%s model=%s",
+            "Game Groq model updated peer_id=%s user_id=%s model=%s",
             message.peer_id,
             message.from_id,
             GROQ_MODEL,
         )
-        await send_reply(message, f"✅ Модель Groq изменена на: `{GROQ_MODEL}`")
+        await send_reply(message, f"✅ Модель Groq (игра) изменена на: `{GROQ_MODEL}`")
+        return
+    if scope == "chat":
+        CHAT_VENICE_MODEL = model_id
+        os.environ["CHAT_VENICE_MODEL"] = model_id
+        log.info(
+            "Chat Venice model updated peer_id=%s user_id=%s model=%s",
+            message.peer_id,
+            message.from_id,
+            CHAT_VENICE_MODEL,
+        )
+        await send_reply(message, f"✅ Модель Venice (чатбот) изменена на: `{CHAT_VENICE_MODEL}`")
         return
     VENICE_MODEL = model_id
     os.environ["VENICE_MODEL"] = model_id
     log.info(
-        "Venice model updated peer_id=%s user_id=%s model=%s",
+        "Game Venice model updated peer_id=%s user_id=%s model=%s",
         message.peer_id,
         message.from_id,
         VENICE_MODEL,
     )
-    await send_reply(message, f"✅ Модель Venice изменена на: `{VENICE_MODEL}`")
+    await send_reply(message, f"✅ Модель Venice (игра) изменена на: `{VENICE_MODEL}`")
 
 @bot.on.message(StartswithRule(CMD_SET_PROVIDER))
 async def set_provider_handler(message: Message):
     if not await ensure_command_allowed(message, CMD_SET_PROVIDER):
         return
-    global LLM_PROVIDER, groq_client
-    args = strip_command(message.text, CMD_SET_PROVIDER).lower()
+    global LLM_PROVIDER, CHAT_LLM_PROVIDER, groq_client
+    args = strip_command(message.text, CMD_SET_PROVIDER)
     if not args:
-        await send_reply(message, f"❌ Укажи провайдера!\nПример: `{CMD_SET_PROVIDER} groq`")
+        await send_reply(message, f"❌ Укажи провайдера!\nПример: `{CMD_SET_PROVIDER} groq` или `{CMD_SET_PROVIDER} chat venice`")
         return
-    if args not in ("groq", "venice"):
+    parts = args.split()
+    scope = parse_llm_scope(parts[0]) if parts else None
+    if scope:
+        if len(parts) < 2:
+            await send_reply(message, f"❌ Укажи провайдера!\nПример: `{CMD_SET_PROVIDER} {scope} groq`")
+            return
+        provider = parts[1].lower()
+    else:
+        scope = "game"
+        provider = parts[0].lower()
+    if provider not in ("groq", "venice"):
         await send_reply(message, "❌ Неверный провайдер. Доступно: groq или venice.")
         return
-    if args == "groq":
+    if provider == "groq":
         if not GROQ_API_KEY:
             await send_reply(message, "❌ Не найден GROQ_API_KEY. Сначала задай ключ.")
             return
         if AsyncGroq is None:
             await send_reply(message, "❌ Пакет groq не установлен.")
             return
-        groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+        if not groq_client:
+            groq_client = AsyncGroq(api_key=GROQ_API_KEY)
     else:
         if not VENICE_API_KEY:
             await send_reply(message, "❌ Не найден VENICE_API_KEY. Сначала задай ключ.")
             return
-        groq_client = None
-    LLM_PROVIDER = args
-    os.environ["LLM_PROVIDER"] = args
+    if scope == "chat":
+        CHAT_LLM_PROVIDER = provider
+        os.environ["CHAT_LLM_PROVIDER"] = provider
+        log.info(
+            "Chat provider updated peer_id=%s user_id=%s provider=%s",
+            message.peer_id,
+            message.from_id,
+            CHAT_LLM_PROVIDER,
+        )
+        await send_reply(message, f"✅ Провайдер чатбота изменен на: `{CHAT_LLM_PROVIDER}`")
+        return
+    LLM_PROVIDER = provider
+    os.environ["LLM_PROVIDER"] = provider
     log.info(
-        "Provider updated peer_id=%s user_id=%s provider=%s",
+        "Game provider updated peer_id=%s user_id=%s provider=%s",
         message.peer_id,
         message.from_id,
         LLM_PROVIDER,
     )
-    await send_reply(message, f"✅ Провайдер изменен на: `{LLM_PROVIDER}`")
+    await send_reply(message, f"✅ Провайдер игры изменен на: `{LLM_PROVIDER}`")
 
 @bot.on.message(StartswithRule(CMD_SET_KEY))
 async def set_key_handler(message: Message):
@@ -1205,11 +1384,8 @@ async def set_key_handler(message: Message):
             message.from_id,
             len(key),
         )
-        if LLM_PROVIDER == "groq":
-            groq_client = AsyncGroq(api_key=GROQ_API_KEY)
-            await send_reply(message, "✅ API ключ Groq сохранен. Провайдер активирован.")
-        else:
-            await send_reply(message, "✅ API ключ Groq сохранен.")
+        groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+        await send_reply(message, "✅ API ключ Groq сохранен.")
         return
     VENICE_API_KEY = key
     os.environ["VENICE_API_KEY"] = key
@@ -1227,19 +1403,52 @@ async def set_key_handler(message: Message):
 async def set_temperature_handler(message: Message):
     if not await ensure_command_allowed(message, CMD_SET_TEMPERATURE):
         return
-    global GROQ_TEMPERATURE, VENICE_TEMPERATURE
+    global GROQ_TEMPERATURE, VENICE_TEMPERATURE, CHAT_GROQ_TEMPERATURE, CHAT_VENICE_TEMPERATURE
     args = strip_command(message.text, CMD_SET_TEMPERATURE)
     if not args:
-        await send_reply(message, f"❌ Укажи температуру!\nПример: `{CMD_SET_TEMPERATURE} 0.9`")
+        await send_reply(message, f"❌ Укажи температуру!\nПример: `{CMD_SET_TEMPERATURE} 0.9` или `{CMD_SET_TEMPERATURE} chat 0.7`")
         return
+    parts = args.split(maxsplit=1)
+    scope = parse_llm_scope(parts[0]) if parts else None
+    if scope:
+        if len(parts) < 2:
+            await send_reply(message, f"❌ Укажи температуру!\nПример: `{CMD_SET_TEMPERATURE} {scope} 0.9`")
+            return
+        value_raw = parts[1]
+    else:
+        scope = "game"
+        value_raw = args
     try:
-        value = float(args.replace(",", "."))
+        value = float(value_raw.replace(",", "."))
     except ValueError:
         await send_reply(message, "❌ Неверный формат температуры. Укажи число, например 0.7")
         return
     if value < 0 or value > 2:
         await send_reply(message, "❌ Температура должна быть в диапазоне 0.0-2.0")
         return
+    if scope == "chat":
+        if CHAT_LLM_PROVIDER == "groq":
+            CHAT_GROQ_TEMPERATURE = value
+            os.environ["CHAT_GROQ_TEMPERATURE"] = str(value)
+            log.info(
+                "Chat Groq temperature updated peer_id=%s user_id=%s value=%s",
+                message.peer_id,
+                message.from_id,
+                CHAT_GROQ_TEMPERATURE,
+            )
+            await send_reply(message, f"✅ Температура Groq (чатбот) установлена: `{CHAT_GROQ_TEMPERATURE}`")
+            return
+        CHAT_VENICE_TEMPERATURE = value
+        os.environ["CHAT_VENICE_TEMPERATURE"] = str(value)
+        log.info(
+            "Chat Venice temperature updated peer_id=%s user_id=%s value=%s",
+            message.peer_id,
+            message.from_id,
+            CHAT_VENICE_TEMPERATURE,
+        )
+        await send_reply(message, f"✅ Температура Venice (чатбот) установлена: `{CHAT_VENICE_TEMPERATURE}`")
+        return
+
     if LLM_PROVIDER == "groq":
         GROQ_TEMPERATURE = value
         os.environ["GROQ_TEMPERATURE"] = str(value)
@@ -1249,7 +1458,7 @@ async def set_temperature_handler(message: Message):
             message.from_id,
             GROQ_TEMPERATURE,
         )
-        await send_reply(message, f"✅ Температура Groq установлена: `{GROQ_TEMPERATURE}`")
+        await send_reply(message, f"✅ Температура Groq (игра) установлена: `{GROQ_TEMPERATURE}`")
         return
     VENICE_TEMPERATURE = value
     os.environ["VENICE_TEMPERATURE"] = str(value)
@@ -1259,7 +1468,7 @@ async def set_temperature_handler(message: Message):
         message.from_id,
         VENICE_TEMPERATURE,
     )
-    await send_reply(message, f"✅ Температура Venice установлена: `{VENICE_TEMPERATURE}`")
+    await send_reply(message, f"✅ Температура Venice (игра) установлена: `{VENICE_TEMPERATURE}`")
 
 @bot.on.message(EqualsRule(CMD_RESET))
 async def reset_daily_game(message: Message):
@@ -1356,6 +1565,7 @@ async def reset_leaderboard_timer(message: Message):
 async def mention_reply_handler(message: Message):
     if not message.text:
         return
+    asyncio.create_task(store_message(message))
     text = message.text
     is_admin_dm = bool(
         ADMIN_USER_ID
@@ -1398,7 +1608,7 @@ async def mention_reply_handler(message: Message):
         chat_messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
         chat_messages.extend(history_messages)
         chat_messages.append({"role": "user", "content": cleaned_for_llm})
-        response_text = await fetch_llm_messages(chat_messages, max_tokens=CHAT_MAX_TOKENS)
+        response_text = await fetch_llm_messages(chat_messages, max_tokens=CHAT_MAX_TOKENS, target="chat")
         response_text = trim_text(response_text, CHAT_RESPONSE_MAX_CHARS)
         if not response_text:
             await send_reply(message, "❌ Ответ получился пустым. Попробуй позже.")
@@ -1429,21 +1639,9 @@ async def mention_reply_handler(message: Message):
 
 @bot.on.message()
 async def logger(message: Message):
-    if not is_message_allowed(message):
+    if not message.text:
         return
-    if message.text and not message.text.startswith("/"):
-        try:
-            user_info = await message.get_user()
-            username = f"{user_info.first_name} {user_info.last_name}"
-        except Exception as e:
-            log.debug("Failed to resolve username user_id=%s: %s", message.from_id, e)
-            username = "Unknown"
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute(
-                "INSERT INTO messages (user_id, peer_id, text, timestamp, username) VALUES (?, ?, ?, ?, ?)",
-                (message.from_id, message.peer_id, message.text, message.date, username)
-            )
-            await db.commit()
+    await store_message(message)
 
 async def start_background_tasks():
     await init_db()
@@ -1463,8 +1661,9 @@ if __name__ == "__main__":
     log.info("Starting %s bot...", GAME_TITLE)
     allowed_peers_label = "all" if ALLOWED_PEER_IDS is None else format_allowed_peers()
     log.info(
-        "Config provider=%s allowed_peers=%s chatbot_enabled=%s",
+        "Config game_provider=%s chat_provider=%s allowed_peers=%s chatbot_enabled=%s",
         LLM_PROVIDER,
+        CHAT_LLM_PROVIDER,
         allowed_peers_label,
         CHATBOT_ENABLED,
     )
