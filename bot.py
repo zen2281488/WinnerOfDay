@@ -95,6 +95,8 @@ CHAT_MESSAGE_MAX_CHARS = read_int_env("CHAT_MESSAGE_MAX_CHARS", default=300, min
 LLM_MAX_TOKENS = read_int_env("LLM_MAX_TOKENS", default=800, min_value=1)
 CHAT_MAX_TOKENS = read_int_env("CHAT_MAX_TOKENS", default=300, min_value=1)
 CHAT_RESPONSE_MAX_CHARS = read_int_env("CHAT_RESPONSE_MAX_CHARS", default=600, min_value=0)
+VK_MESSAGE_MAX_CHARS = read_int_env("VK_MESSAGE_MAX_CHARS", default=3500, min_value=500) or 3500
+CHAT_RESPONSE_MAX_PARTS = read_int_env("CHAT_RESPONSE_MAX_PARTS", default=4, min_value=1) or 4
 
 BOT_REPLY_FULL_LIMIT = read_int_env("CHAT_BOT_FULL_LIMIT", default=2, min_value=0)
 BOT_REPLY_SHORT_LIMIT = read_int_env("CHAT_BOT_SHORT_LIMIT", default=2, min_value=0)
@@ -130,6 +132,21 @@ if not CHATBOT_PROACTIVE_SYSTEM_PROMPT:
         "Схема: {\"respond\": true|false, \"reply\": true|false, \"text\": \"...\"}\n"
         "Если respond=false: reply=false и text пустая строка.\n"
     )
+
+# === Proactive реакции (эмодзи-реакции на сообщения) ===
+CHATBOT_PROACTIVE_REACTIONS_ENABLED = read_bool_env("CHATBOT_PROACTIVE_REACTIONS_ENABLED", default=True)
+CHATBOT_PROACTIVE_REACTION_PROBABILITY = read_float_env("CHATBOT_PROACTIVE_REACTION_PROBABILITY", default=0.18)
+if CHATBOT_PROACTIVE_REACTION_PROBABILITY is None:
+    CHATBOT_PROACTIVE_REACTION_PROBABILITY = 0.18
+CHATBOT_PROACTIVE_REACTION_COOLDOWN_SECONDS = (
+    read_int_env("CHATBOT_PROACTIVE_REACTION_COOLDOWN_SECONDS", default=120, min_value=0) or 120
+)
+CHATBOT_PROACTIVE_REACTION_IDS = read_int_list_env("CHATBOT_PROACTIVE_REACTION_IDS")
+if not CHATBOT_PROACTIVE_REACTION_IDS:
+    CHATBOT_PROACTIVE_REACTION_IDS = list(range(1, 17))
+CHATBOT_PROACTIVE_REACTION_IDS = [rid for rid in CHATBOT_PROACTIVE_REACTION_IDS if 1 <= int(rid) <= 16]
+if not CHATBOT_PROACTIVE_REACTION_IDS:
+    CHATBOT_PROACTIVE_REACTION_IDS = list(range(1, 17))
 
 # === Сводка чата (mid-term память) ===
 CHAT_SUMMARY_ENABLED = read_bool_env("CHAT_SUMMARY_ENABLED", default=False)
@@ -258,6 +275,8 @@ USER_NAME_CACHE: dict[int, str] = {}
 LAST_BOT_MESSAGE_TS_BY_PEER: dict[int, int] = {}
 MESSAGES_SINCE_BOT_BY_PEER: dict[int, int] = {}
 PROACTIVE_LOCKS: dict[int, asyncio.Lock] = {}
+LAST_REACTION_TS_BY_PEER: dict[int, int] = {}
+LAST_REACTION_CMID_BY_PEER: dict[int, int] = {}
 CHAT_SUMMARY_PENDING_BY_PEER: dict[int, int] = {}
 CHAT_SUMMARY_LAST_TRIGGER_TS_BY_PEER: dict[int, int] = {}
 CHAT_SUMMARY_LOCKS: dict[int, asyncio.Lock] = {}
@@ -312,6 +331,7 @@ CMD_SET_TEMPERATURE = "/установить_температуру"
 CMD_SET_PROVIDER = "/провайдер"
 CMD_LIST_MODELS = "/список_моделей"
 CMD_PROMPT = "/промт"
+CMD_CHAT_LIMIT = "/лимит"
 CMD_LEADERBOARD = "/лидерборд"
 CMD_LEADERBOARD_TIMER_SET = "/таймер_лидерборда"
 CMD_LEADERBOARD_TIMER_RESET = "/сброс_таймера_лидерборда"
@@ -498,6 +518,62 @@ def trim_text(text: str, max_chars: int) -> str:
     if len(cleaned) > max_chars:
         return cleaned[:max_chars].rstrip()
     return cleaned
+
+def split_text_for_sending(text: str, *, max_chars: int, max_parts: int) -> list[str]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return []
+    if max_chars <= 0:
+        return [cleaned]
+    max_parts = max(1, int(max_parts or 1))
+
+    parts: list[str] = []
+    remaining = cleaned
+    breakers: list[tuple[str, int]] = [
+        ("\n\n", 0),
+        ("\n", 0),
+        (". ", 1),
+        ("! ", 1),
+        ("? ", 1),
+        ("; ", 1),
+        (", ", 1),
+        (" ", 0),
+    ]
+
+    while remaining and len(parts) < max_parts:
+        if len(remaining) <= max_chars:
+            parts.append(remaining)
+            remaining = ""
+            break
+
+        window = remaining[: max_chars + 1]
+        split_idx = 0
+        for sep, add in breakers:
+            idx = window.rfind(sep)
+            if idx > 0:
+                split_idx = idx + add
+                break
+        if split_idx <= 0:
+            split_idx = max_chars
+
+        chunk = remaining[:split_idx].rstrip()
+        if chunk:
+            parts.append(chunk)
+        remaining = remaining[split_idx:].lstrip()
+
+    if remaining:
+        # Safety: avoid flooding the chat with too many messages.
+        tail_note = "\n\n(ответ слишком длинный; увеличь `/лимит` или попроси продолжение)"
+        if parts:
+            if len(parts[-1]) + len(tail_note) <= max_chars:
+                parts[-1] = (parts[-1].rstrip() + tail_note).strip()
+            else:
+                shortened = trim_text(parts[-1], max(1, max_chars - len(tail_note)))
+                parts[-1] = (shortened.rstrip() + tail_note).strip()
+        else:
+            parts.append(trim_text(remaining, max_chars))
+
+    return parts
 
 def trim_chat_text(text: str) -> str:
     return trim_text(text, CHAT_MESSAGE_MAX_CHARS)
@@ -776,6 +852,8 @@ def schedule_chat_summary_update(peer_id: int):
         return
     if not peer_id or peer_id < 2_000_000_000:
         return
+    if ALLOWED_PEER_IDS is not None and peer_id not in ALLOWED_PEER_IDS:
+        return
     pending = CHAT_SUMMARY_PENDING_BY_PEER.get(peer_id, 0) + 1
     CHAT_SUMMARY_PENDING_BY_PEER[peer_id] = pending
     if pending < CHAT_SUMMARY_EVERY_MESSAGES:
@@ -795,6 +873,8 @@ async def update_chat_summary(peer_id: int):
     if not CHAT_SUMMARY_ENABLED:
         return
     if not peer_id or peer_id < 2_000_000_000:
+        return
+    if ALLOWED_PEER_IDS is not None and peer_id not in ALLOWED_PEER_IDS:
         return
     if not CHATBOT_ENABLED:
         return
@@ -1031,6 +1111,8 @@ def schedule_user_memory_update(peer_id: int, user_id: int):
         return
     if not peer_id or peer_id < 2_000_000_000:
         return
+    if ALLOWED_PEER_IDS is not None and peer_id not in ALLOWED_PEER_IDS:
+        return
     if not user_id or user_id <= 0:
         return
     key = (int(peer_id), int(user_id))
@@ -1053,6 +1135,8 @@ async def update_user_memory(peer_id: int, user_id: int):
     if not CHAT_USER_MEMORY_ENABLED:
         return
     if not peer_id or peer_id < 2_000_000_000:
+        return
+    if ALLOWED_PEER_IDS is not None and peer_id not in ALLOWED_PEER_IDS:
         return
     if not user_id or user_id <= 0:
         return
@@ -1177,6 +1261,18 @@ def format_allowed_peers() -> str:
         return "не заданы"
     return ", ".join(str(peer_id) for peer_id in ALLOWED_PEER_IDS)
 
+def _coerce_positive_int(value) -> int | None:
+    if value is None:
+        return None
+    # bool is a subclass of int; protect against True/False being treated as ids.
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
 async def ensure_message_allowed(message: Message, action_label: str | None = None) -> bool:
     if is_message_allowed(message):
         return True
@@ -1204,14 +1300,16 @@ def get_reply_to_id(message: Message):
     reply_to = getattr(message, "conversation_message_id", None)
     if reply_to is None and isinstance(message, dict):
         reply_to = message.get("conversation_message_id")
-    if isinstance(reply_to, int) and reply_to > 0:
-        return reply_to
+    candidate = _coerce_positive_int(reply_to)
+    if candidate:
+        return candidate
     reply_message = getattr(message, "reply_message", None)
     reply_to = getattr(reply_message, "conversation_message_id", None)
     if reply_to is None and isinstance(reply_message, dict):
         reply_to = reply_message.get("conversation_message_id")
-    if isinstance(reply_to, int) and reply_to > 0:
-        return reply_to
+    candidate = _coerce_positive_int(reply_to)
+    if candidate:
+        return candidate
     return None
 
 def mark_bot_activity(peer_id: int):
@@ -1222,31 +1320,68 @@ def mark_bot_activity(peer_id: int):
     MESSAGES_SINCE_BOT_BY_PEER[peer_id] = 0
 
 async def send_reply(message: Message, text: str, **kwargs):
-    reply_to = get_reply_to_id(message)
-    if reply_to:
-        kwargs.setdefault("reply_to", reply_to)
-    try:
-        await message.answer(text, **kwargs)
-        mark_bot_activity(message.peer_id)
-    except Exception as e:
-        error_text = str(e).lower()
-        if reply_to and ("reply_to" in error_text or "forwarded message not found" in error_text):
-            try:
-                log.warning("send_reply failed with reply_to, retrying without reply_to: %s", e)
-                kwargs.pop("reply_to", None)
-                await message.answer(text, **kwargs)
-                mark_bot_activity(message.peer_id)
-                return
-            except Exception as inner:
-                log.exception("send_reply fallback failed: %s", inner)
-                return
-        log.exception("send_reply failed: %s", e)
+    # VK "реплай" (как в UI) иногда работает надежнее через forward+is_reply,
+    # поэтому пробуем несколько вариантов и в конце фоллбек на обычную отправку.
+    peer_id = _coerce_positive_int(getattr(message, "peer_id", None)) or 0
+    cmid = get_conversation_message_id(message) or get_reply_to_id(message)
+    msg_id = _coerce_positive_int(getattr(message, "id", None))
+
+    attempts: list[tuple[str, dict]] = []
+    if "reply_to" in kwargs or "forward" in kwargs:
+        attempts.append(("provided", dict(kwargs)))
+    else:
+        if peer_id and cmid:
+            forward_payload = {"peer_id": peer_id, "conversation_message_ids": [cmid], "is_reply": 1}
+            attempts.append(("forward_cmid", {**kwargs, "forward": json.dumps(forward_payload, ensure_ascii=False)}))
+        if cmid:
+            attempts.append(("reply_to_cmid", {**kwargs, "reply_to": cmid}))
+        if msg_id and msg_id != cmid:
+            attempts.append(("reply_to_msgid", {**kwargs, "reply_to": msg_id}))
+        if peer_id and msg_id:
+            forward_payload = {"peer_id": peer_id, "message_ids": [msg_id], "is_reply": 1}
+            attempts.append(("forward_msgid", {**kwargs, "forward": json.dumps(forward_payload, ensure_ascii=False)}))
+
+    attempts.append(("plain", dict(kwargs)))
+
+    for label, attempt_kwargs in attempts:
+        try:
+            await message.answer(text, **attempt_kwargs)
+            mark_bot_activity(message.peer_id)
+            return
+        except Exception as e:
+            error_text = str(e).lower()
+            retryable = (
+                label != "plain"
+                and (
+                    "reply_to" in error_text
+                    or "forward" in error_text
+                    or "forwarded message not found" in error_text
+                    or "conversation_message_id" in error_text
+                )
+            )
+            if retryable:
+                log.warning("send_reply failed (%s), retrying fallback: %s", label, e)
+                continue
+            log.exception("send_reply failed (%s): %s", label, e)
+            return
+
+async def send_reply_in_parts(message: Message, parts: list[str], **kwargs):
+    parts = [part.strip() for part in (parts or []) if part and part.strip()]
+    if not parts:
+        return
+    await send_reply(message, parts[0], **kwargs)
+    # Остальные части отправляем без reply_to, чтобы не засорять тред ответов.
+    for part in parts[1:]:
+        try:
+            await message.answer(part)
+            mark_bot_activity(message.peer_id)
+        except Exception as e:
+            log.exception("send_reply_in_parts failed: %s", e)
+            break
 
 def get_conversation_message_id(message: Message) -> int | None:
     value = getattr(message, "conversation_message_id", None)
-    if isinstance(value, int) and value > 0:
-        return value
-    return None
+    return _coerce_positive_int(value)
 
 async def store_message(message: Message):
     try:
@@ -1534,6 +1669,20 @@ def parse_setting_float(value: str | None, default: float) -> float:
     except ValueError:
         return default
 
+def parse_setting_int(value: str | None, default: int, *, min_value: int | None = None) -> int:
+    if value is None:
+        return default
+    cleaned = value.strip()
+    if cleaned == "":
+        return default
+    try:
+        number = int(cleaned)
+    except ValueError:
+        return default
+    if min_value is not None and number < min_value:
+        return min_value
+    return number
+
 def build_bot_settings_defaults() -> dict[str, str]:
     return {
         "LLM_PROVIDER": setting_to_text(LLM_PROVIDER),
@@ -1552,6 +1701,7 @@ def build_bot_settings_defaults() -> dict[str, str]:
         "CHATBOT_PROACTIVE_ENABLED": "1" if CHATBOT_PROACTIVE_ENABLED else "0",
         "CHAT_SUMMARY_ENABLED": "1" if CHAT_SUMMARY_ENABLED else "0",
         "CHAT_USER_MEMORY_ENABLED": "1" if CHAT_USER_MEMORY_ENABLED else "0",
+        "CHAT_RESPONSE_MAX_CHARS": setting_to_text(CHAT_RESPONSE_MAX_CHARS),
         "USER_PROMPT_TEMPLATE": setting_to_text(USER_PROMPT_TEMPLATE),
     }
 
@@ -1581,6 +1731,7 @@ def apply_bot_settings(settings: dict[str, str]):
     global CHATBOT_PROACTIVE_ENABLED
     global CHAT_SUMMARY_ENABLED
     global CHAT_USER_MEMORY_ENABLED
+    global CHAT_RESPONSE_MAX_CHARS
     global USER_PROMPT_TEMPLATE
     global groq_client
 
@@ -1629,6 +1780,11 @@ def apply_bot_settings(settings: dict[str, str]):
         settings.get("CHAT_USER_MEMORY_ENABLED"),
         CHAT_USER_MEMORY_ENABLED,
     )
+    CHAT_RESPONSE_MAX_CHARS = parse_setting_int(
+        settings.get("CHAT_RESPONSE_MAX_CHARS"),
+        CHAT_RESPONSE_MAX_CHARS,
+        min_value=0,
+    )
 
     prompt = settings.get("USER_PROMPT_TEMPLATE")
     if prompt is not None and prompt != "":
@@ -1648,6 +1804,7 @@ def apply_bot_settings(settings: dict[str, str]):
     os.environ["CHATBOT_PROACTIVE_ENABLED"] = "1" if CHATBOT_PROACTIVE_ENABLED else "0"
     os.environ["CHAT_SUMMARY_ENABLED"] = "1" if CHAT_SUMMARY_ENABLED else "0"
     os.environ["CHAT_USER_MEMORY_ENABLED"] = "1" if CHAT_USER_MEMORY_ENABLED else "0"
+    os.environ["CHAT_RESPONSE_MAX_CHARS"] = str(CHAT_RESPONSE_MAX_CHARS)
     os.environ["USER_PROMPT_TEMPLATE"] = USER_PROMPT_TEMPLATE
     if GROQ_API_KEY:
         os.environ["GROQ_API_KEY"] = GROQ_API_KEY
@@ -2465,6 +2622,7 @@ async def show_settings(message: Message):
         f"🧠 **Контекст чата:** `{chat_context_status}` (посл. `{CHAT_CONTEXT_LIMIT}`)\n"
         f"📝 **Сводка чата:** `{chat_summary_status}` (каждые `{CHAT_SUMMARY_EVERY_MESSAGES}`, cd `{CHAT_SUMMARY_COOLDOWN_SECONDS}`s)\n"
         f"🧩 **Память (люди):** `{user_memory_status}` (каждые `{CHAT_USER_MEMORY_EVERY_MESSAGES}`, cd `{CHAT_USER_MEMORY_COOLDOWN_SECONDS}`s)\n"
+        f"📏 **Лимит ответа (чат):** `{CHAT_RESPONSE_MAX_CHARS}` символов\n"
         f"Последнее обновление: {format_build_date(BUILD_DATE)}\n"
         f"{schedule_line}\n"
         f"{leaderboard_line}\n"
@@ -2481,6 +2639,7 @@ async def show_settings(message: Message):
         f"• `{CMD_CHATBOT} sum on|off` - Включить/выключить сводку чата\n"
         f"• `{CMD_CHATBOT} mem on|off` - Включить/выключить память по участникам\n"
         f"• `{CMD_MEMORY}` или `{CMD_MEMORY} сброс` - Показать/сбросить твою память\n"
+        f"• `{CMD_CHAT_LIMIT} <число>` - Лимит символов в ответе чатбота (0 = без лимита; ответ будет разбит на части)\n"
         f"• `{CMD_RESET_CHAT}` - Сбросить историю чатбота с тобой\n"
         f"• `{CMD_BAN} Имя Фамилия` - Забанить пользователя (чатбот)\n"
         f"• `{CMD_UNBAN} Имя Фамилия` - Разбанить пользователя (чатбот)\n\n"
@@ -2879,6 +3038,40 @@ async def memory_handler(message: Message):
         f"🧩 Память про [id{target_user_id}|{target_name}] (обновлено {updated_label}):\n{summary}\n\n"
         f"Сброс: `{CMD_MEMORY} сброс`",
     )
+
+@bot.on.message(StartswithRule(CMD_CHAT_LIMIT))
+async def chat_limit_handler(message: Message):
+    if not await ensure_command_allowed(message, CMD_CHAT_LIMIT):
+        return
+    # Это глобальная настройка, поэтому ограничим админами.
+    if not await ensure_admin_only(message, CMD_CHAT_LIMIT):
+        return
+    global CHAT_RESPONSE_MAX_CHARS
+    args = strip_command(message.text, CMD_CHAT_LIMIT)
+    normalized = normalize_spaces(args)
+    if not normalized:
+        await send_reply(
+            message,
+            f"📏 Текущий лимит ответа чатбота: `{CHAT_RESPONSE_MAX_CHARS}` символов.\n"
+            f"Команда: `{CMD_CHAT_LIMIT} 1200` (0 = без лимита; ответ будет разбит на части).",
+        )
+        return
+    try:
+        value = int(normalized)
+    except ValueError:
+        await send_reply(message, "❌ Укажи число. Пример: `/лимит 1200`")
+        return
+    if value < 0:
+        await send_reply(message, "❌ Лимит не может быть отрицательным.")
+        return
+
+    CHAT_RESPONSE_MAX_CHARS = value
+    os.environ["CHAT_RESPONSE_MAX_CHARS"] = str(value)
+    await set_bot_setting("CHAT_RESPONSE_MAX_CHARS", str(value))
+    note = ""
+    if value == 0:
+        note = f"\nℹ️ При 0 лимит по символам не применяется. Ответ будет разбит на части (до {CHAT_RESPONSE_MAX_PARTS} сообщений)."
+    await send_reply(message, f"✅ Лимит ответа чатбота теперь: `{CHAT_RESPONSE_MAX_CHARS}` символов.{note}")
 
 @bot.on.message(StartswithRule(CMD_LIST_MODELS))
 async def list_models_handler(message: Message):
@@ -3398,6 +3591,40 @@ def _parse_boolish(value) -> bool | None:
             return False
     return None
 
+async def maybe_send_proactive_reaction(message: Message, peer_id: int) -> bool:
+    if not CHATBOT_PROACTIVE_REACTIONS_ENABLED:
+        return False
+    cmid = get_conversation_message_id(message)
+    if not cmid:
+        return False
+    now_ts = int(datetime.datetime.now(MSK_TZ).timestamp())
+    last_ts = int(LAST_REACTION_TS_BY_PEER.get(peer_id, 0) or 0)
+    if CHATBOT_PROACTIVE_REACTION_COOLDOWN_SECONDS > 0 and now_ts - last_ts < CHATBOT_PROACTIVE_REACTION_COOLDOWN_SECONDS:
+        return False
+    if int(LAST_REACTION_CMID_BY_PEER.get(peer_id, 0) or 0) == cmid:
+        return False
+
+    prob = float(CHATBOT_PROACTIVE_REACTION_PROBABILITY or 0.0)
+    if prob <= 0:
+        return False
+    if prob < 1 and random.random() > prob:
+        return False
+
+    reaction_id = int(random.choice(CHATBOT_PROACTIVE_REACTION_IDS or [1]))
+    try:
+        await bot.api.request(
+            "messages.sendReaction",
+            {"peer_id": peer_id, "cmid": cmid, "reaction_id": reaction_id},
+        )
+        LAST_REACTION_TS_BY_PEER[peer_id] = now_ts
+        LAST_REACTION_CMID_BY_PEER[peer_id] = cmid
+        mark_bot_activity(peer_id)
+        log.debug("Proactive reaction sent peer_id=%s cmid=%s reaction_id=%s", peer_id, cmid, reaction_id)
+        return True
+    except Exception as e:
+        log.debug("Proactive reaction failed peer_id=%s cmid=%s: %s", peer_id, cmid, e)
+        return False
+
 async def maybe_proactive_chatbot(message: Message):
     global _CHATBOT_PROACTIVE_GUARD_WARNED
     try:
@@ -3511,6 +3738,7 @@ async def maybe_proactive_chatbot(message: Message):
             reply = _parse_boolish(parsed.get("reply")) or False
             out_text = str(parsed.get("text") or "").strip()
             if not respond or not out_text:
+                await maybe_send_proactive_reaction(message, peer_id)
                 return
             out_text = trim_text(out_text, CHATBOT_PROACTIVE_MAX_CHARS)
             if not out_text:
@@ -3655,13 +3883,34 @@ async def mention_reply_handler(message: Message):
             )
             await send_reply(message, "⚠️ Не удалось проверить запрос на безопасность. Попробуй позже.")
             return
-        response_text = await fetch_llm_messages(chat_messages, max_tokens=CHAT_MAX_TOKENS, target="chat")
-        response_text = trim_text(response_text, CHAT_RESPONSE_MAX_CHARS)
-        if not response_text:
+        response_text_raw = await fetch_llm_messages(chat_messages, max_tokens=CHAT_MAX_TOKENS, target="chat")
+        response_text_raw = str(response_text_raw or "").strip()
+        if not response_text_raw:
             await send_reply(message, "❌ Ответ получился пустым. Попробуй позже.")
             return
+
+        response_limited = response_text_raw
+        if CHAT_RESPONSE_MAX_CHARS > 0 and len(response_limited) > CHAT_RESPONSE_MAX_CHARS:
+            # Не режем посреди слова: аккуратно ограничиваем по символам.
+            limited_parts = split_text_for_sending(
+                response_limited,
+                max_chars=CHAT_RESPONSE_MAX_CHARS,
+                max_parts=1,
+            )
+            response_limited = limited_parts[0] if limited_parts else ""
+        response_parts = split_text_for_sending(
+            response_limited,
+            max_chars=VK_MESSAGE_MAX_CHARS,
+            max_parts=CHAT_RESPONSE_MAX_PARTS,
+        )
+        if not response_parts:
+            await send_reply(message, "❌ Ответ получился пустым. Попробуй позже.")
+            return
+
+        response_sent = "\n\n".join(response_parts).strip()
         try:
-            await ensure_chat_guard([{"role": "assistant", "content": response_text}])
+            for part in response_parts:
+                await ensure_chat_guard([{"role": "assistant", "content": part}])
         except ChatGuardBlocked as blocked:
             log.info(
                 "Chat response blocked by guard peer_id=%s user_id=%s reason=%s",
@@ -3695,10 +3944,10 @@ async def mention_reply_handler(message: Message):
             "Chatbot response peer_id=%s user_id=%s chars=%s",
             message.peer_id,
             message.from_id,
-            len(response_text),
+            len(response_sent),
         )
-        await send_reply(message, response_text)
-        response_for_store = trim_text(response_text, BOT_REPLY_FULL_MAX_CHARS)
+        await send_reply_in_parts(message, response_parts)
+        response_for_store = trim_text(response_sent, BOT_REPLY_FULL_MAX_CHARS)
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute(
                 "INSERT INTO bot_dialogs (peer_id, user_id, role, text, timestamp) VALUES (?, ?, ?, ?, ?)",
@@ -3760,5 +4009,3 @@ if __name__ == "__main__":
     )
     bot.loop_wrapper.on_startup.append(start_background_tasks())
     bot.run_forever()
-
-
