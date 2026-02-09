@@ -522,14 +522,15 @@ async def ensure_command_allowed(message: Message, command: str) -> bool:
 def get_reply_to_id(message: Message):
     if getattr(message, "is_unavailable", False):
         return None
+    reply_to = getattr(message, "conversation_message_id", None)
+    if reply_to is None and isinstance(message, dict):
+        reply_to = message.get("conversation_message_id")
+    if isinstance(reply_to, int) and reply_to > 0:
+        return reply_to
     reply_message = getattr(message, "reply_message", None)
     reply_to = getattr(reply_message, "conversation_message_id", None)
     if reply_to is None and isinstance(reply_message, dict):
         reply_to = reply_message.get("conversation_message_id")
-    if isinstance(reply_to, int) and reply_to > 0:
-        return reply_to
-
-    reply_to = getattr(message, "conversation_message_id", None)
     if isinstance(reply_to, int) and reply_to > 0:
         return reply_to
     return None
@@ -1465,27 +1466,14 @@ async def show_settings(message: Message):
     if not await ensure_command_allowed(message, CMD_SETTINGS):
         return
     log.debug("Settings requested peer_id=%s user_id=%s", message.peer_id, message.from_id)
-    if LLM_PROVIDER == "groq":
-        game_provider_label = "Groq"
-        game_key_short = GROQ_API_KEY[:5] + "..." if GROQ_API_KEY else "не задан"
-        game_model = GROQ_MODEL
-        game_temperature = GROQ_TEMPERATURE
-    else:
-        game_provider_label = "Venice"
-        game_key_short = VENICE_API_KEY[:5] + "..." if VENICE_API_KEY else "не задан"
-        game_model = VENICE_MODEL
-        game_temperature = VENICE_TEMPERATURE
-
-    if CHAT_LLM_PROVIDER == "groq":
-        chat_provider_label = "Groq"
-        chat_key_short = GROQ_API_KEY[:5] + "..." if GROQ_API_KEY else "не задан"
-        chat_model = CHAT_GROQ_MODEL
-        chat_temperature = CHAT_GROQ_TEMPERATURE
-    else:
-        chat_provider_label = "Venice"
-        chat_key_short = VENICE_API_KEY[:5] + "..." if VENICE_API_KEY else "не задан"
-        chat_model = CHAT_VENICE_MODEL
-        chat_temperature = CHAT_VENICE_TEMPERATURE
+    game_provider_label = "Groq" if LLM_PROVIDER == "groq" else "Venice"
+    chat_provider_label = "Groq" if CHAT_LLM_PROVIDER == "groq" else "Venice"
+    groq_key_short = GROQ_API_KEY[:5] + "..." if GROQ_API_KEY else "не задан"
+    venice_key_short = VENICE_API_KEY[:5] + "..." if VENICE_API_KEY else "не задан"
+    game_groq_marker = " ✅" if LLM_PROVIDER == "groq" else ""
+    game_venice_marker = " ✅" if LLM_PROVIDER == "venice" else ""
+    chat_groq_marker = " ✅" if CHAT_LLM_PROVIDER == "groq" else ""
+    chat_venice_marker = " ✅" if CHAT_LLM_PROVIDER == "venice" else ""
     if ALLOWED_PEER_IDS is None:
         access_line = "без ограничений"
     else:
@@ -1520,14 +1508,13 @@ async def show_settings(message: Message):
         leaderboard_line = "Лидерборд (МСК): не установлен\n"
     text = (
         f"🎛 **Настройки бота**\n\n"
-        f"🎮 **Игра LLM:** `{game_provider_label}`\n"
-        f"• модель: `{game_model}`\n"
-        f"• температура: `{game_temperature}`\n"
-        f"• ключ: `{game_key_short}`\n\n"
-        f"💬 **Чатбот LLM:** `{chat_provider_label}`\n"
-        f"• модель: `{chat_model}`\n"
-        f"• температура: `{chat_temperature}`\n"
-        f"• ключ: `{chat_key_short}`\n\n"
+        f"🎮 **Игра LLM:** активный `{game_provider_label}`\n"
+        f"• groq: `{GROQ_MODEL}` (t `{GROQ_TEMPERATURE}`){game_groq_marker}\n"
+        f"• venice: `{VENICE_MODEL}` (t `{VENICE_TEMPERATURE}`){game_venice_marker}\n\n"
+        f"💬 **Чатбот LLM:** активный `{chat_provider_label}`\n"
+        f"• groq: `{CHAT_GROQ_MODEL}` (t `{CHAT_GROQ_TEMPERATURE}`){chat_groq_marker}\n"
+        f"• venice: `{CHAT_VENICE_MODEL}` (t `{CHAT_VENICE_TEMPERATURE}`){chat_venice_marker}\n\n"
+        f"🔑 **Ключи:** groq `{groq_key_short}`, venice `{venice_key_short}`\n\n"
         f"📦 **Провайдеры:** `groq`, `venice`\n"
         f"🔒 **Доступ:** {access_line}\n"
         f"🧭 **Peer ID:** `{message.peer_id}`\n"
@@ -1845,7 +1832,13 @@ async def set_model_handler(message: Message):
                 message.from_id,
                 CHAT_GROQ_MODEL,
             )
-            await send_reply(message, f"✅ Модель Groq (чатбот) изменена на: `{CHAT_GROQ_MODEL}`")
+            note = ""
+            if CHAT_LLM_PROVIDER != "groq":
+                note = (
+                    f"\nℹ️ Сейчас чатбот использует провайдер `{CHAT_LLM_PROVIDER}`. "
+                    f"Чтобы использовать эту модель: `{CMD_SET_PROVIDER} chat groq`"
+                )
+            await send_reply(message, f"✅ Модель Groq (чатбот) изменена на: `{CHAT_GROQ_MODEL}`{note}")
             return
         GROQ_MODEL = model_id
         os.environ["GROQ_MODEL"] = model_id
@@ -1856,7 +1849,13 @@ async def set_model_handler(message: Message):
             message.from_id,
             GROQ_MODEL,
         )
-        await send_reply(message, f"✅ Модель Groq (игра) изменена на: `{GROQ_MODEL}`")
+        note = ""
+        if LLM_PROVIDER != "groq":
+            note = (
+                f"\nℹ️ Сейчас игра использует провайдер `{LLM_PROVIDER}`. "
+                f"Чтобы использовать эту модель: `{CMD_SET_PROVIDER} groq`"
+            )
+        await send_reply(message, f"✅ Модель Groq (игра) изменена на: `{GROQ_MODEL}`{note}")
         return
     if scope == "chat":
         CHAT_VENICE_MODEL = model_id
@@ -1868,7 +1867,13 @@ async def set_model_handler(message: Message):
             message.from_id,
             CHAT_VENICE_MODEL,
         )
-        await send_reply(message, f"✅ Модель Venice (чатбот) изменена на: `{CHAT_VENICE_MODEL}`")
+        note = ""
+        if CHAT_LLM_PROVIDER != "venice":
+            note = (
+                f"\nℹ️ Сейчас чатбот использует провайдер `{CHAT_LLM_PROVIDER}`. "
+                f"Чтобы использовать эту модель: `{CMD_SET_PROVIDER} chat venice`"
+            )
+        await send_reply(message, f"✅ Модель Venice (чатбот) изменена на: `{CHAT_VENICE_MODEL}`{note}")
         return
     VENICE_MODEL = model_id
     os.environ["VENICE_MODEL"] = model_id
@@ -1879,7 +1884,13 @@ async def set_model_handler(message: Message):
         message.from_id,
         VENICE_MODEL,
     )
-    await send_reply(message, f"✅ Модель Venice (игра) изменена на: `{VENICE_MODEL}`")
+    note = ""
+    if LLM_PROVIDER != "venice":
+        note = (
+            f"\nℹ️ Сейчас игра использует провайдер `{LLM_PROVIDER}`. "
+            f"Чтобы использовать эту модель: `{CMD_SET_PROVIDER} venice`"
+        )
+    await send_reply(message, f"✅ Модель Venice (игра) изменена на: `{VENICE_MODEL}`{note}")
 
 @bot.on.message(StartswithRule(CMD_SET_PROVIDER))
 async def set_provider_handler(message: Message):
