@@ -201,6 +201,7 @@ CMD_LEADERBOARD_TIMER_SET = "/таймер_лидерборда"
 CMD_LEADERBOARD_TIMER_RESET = "/сброс_таймера_лидерборда"
 CMD_BAN = "/бан"
 CMD_UNBAN = "/разбан"
+CMD_CHATBOT = "/чатбот"
 
 DB_NAME = os.getenv("DB_PATH", "chat_history.db")
 MSK_TZ = datetime.timezone(datetime.timedelta(hours=3))
@@ -1367,6 +1368,7 @@ async def show_settings(message: Message):
         f"• `{CMD_LIST_MODELS} <провайдер>` - Список моделей (Live)\n\n"
         f"• `{CMD_PROMPT}` или `{CMD_PROMPT} <текст>` - Показать/обновить user prompt\n\n"
         f"**💬 Чатбот:**\n"
+        f"• `{CMD_CHATBOT} on|off` - Включить/выключить чатбота\n"
         f"• `{CMD_BAN} Имя Фамилия` - Забанить пользователя (чатбот)\n"
         f"• `{CMD_UNBAN} Имя Фамилия` - Разбанить пользователя (чатбот)\n\n"
         f"**🎮 Игра:**\n"
@@ -1469,6 +1471,60 @@ async def unban_user_handler(message: Message):
         message,
         f"✅ Пользователь [id{target_user_id}|{target_name}] разбанен для чатбота в этом чате.",
     )
+
+@bot.on.message(StartswithRule(CMD_CHATBOT))
+async def chatbot_toggle_handler(message: Message):
+    if not await ensure_command_allowed(message, CMD_CHATBOT):
+        return
+    if not await ensure_admin_only(message, CMD_CHATBOT):
+        return
+    global CHATBOT_ENABLED, groq_client
+    args = strip_command(message.text, CMD_CHATBOT)
+    normalized = args.strip().lower() if args else ""
+    if not normalized:
+        status = "включен" if CHATBOT_ENABLED else "выключен"
+        await send_reply(
+            message,
+            f"💬 Чатбот сейчас `{status}`.\n"
+            f"Команда: `{CMD_CHATBOT} on` или `{CMD_CHATBOT} off`",
+        )
+        return
+
+    enable_values = {"on", "1", "true", "yes", "enable", "вкл", "включить", "включи", "да"}
+    disable_values = {"off", "0", "false", "no", "disable", "выкл", "выключить", "выключи", "нет"}
+    if normalized in enable_values:
+        new_state = True
+    elif normalized in disable_values:
+        new_state = False
+    else:
+        await send_reply(message, "❌ Неверный аргумент. Используй: on/off или включить/выключить.")
+        return
+
+    if new_state and not CHATBOT_ENABLED:
+        provider, _, _, _, _ = get_llm_settings("chat")
+        if provider == "groq":
+            if not GROQ_API_KEY:
+                await send_reply(message, "❌ Нельзя включить чатбот: не найден GROQ_API_KEY.")
+                return
+            if AsyncGroq is None:
+                await send_reply(message, "❌ Нельзя включить чатбот: пакет groq не установлен.")
+                return
+            if not groq_client:
+                groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+        else:
+            if not VENICE_API_KEY:
+                await send_reply(message, "❌ Нельзя включить чатбот: не найден VENICE_API_KEY.")
+                return
+
+    CHATBOT_ENABLED = new_state
+    os.environ["CHATBOT_ENABLED"] = "1" if new_state else "0"
+    log.info(
+        "Chatbot toggled peer_id=%s user_id=%s enabled=%s",
+        message.peer_id,
+        message.from_id,
+        CHATBOT_ENABLED,
+    )
+    await send_reply(message, f"✅ Чатбот теперь {'включен' if CHATBOT_ENABLED else 'выключен'}.")
 
 @bot.on.message(StartswithRule(CMD_LIST_MODELS))
 async def list_models_handler(message: Message):
