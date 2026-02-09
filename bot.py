@@ -130,6 +130,16 @@ CHAT_VENICE_TEMPERATURE = read_float_env("CHAT_VENICE_TEMPERATURE", default=VENI
 if CHAT_VENICE_TEMPERATURE is None:
     CHAT_VENICE_TEMPERATURE = VENICE_TEMPERATURE
 
+CHAT_GROQ_GUARD_ENABLED = read_bool_env("CHAT_GROQ_GUARD_ENABLED", default=True)
+CHAT_GROQ_GUARD_MODEL = (
+    os.getenv("CHAT_GROQ_GUARD_MODEL", "meta-llama/llama-guard-4-12b") or ""
+).strip() or "meta-llama/llama-guard-4-12b"
+CHAT_GROQ_GUARD_MAX_TOKENS = read_int_env("CHAT_GROQ_GUARD_MAX_TOKENS", default=128, min_value=1)
+CHAT_GROQ_GUARD_BLOCK_MESSAGE = os.getenv(
+    "CHAT_GROQ_GUARD_BLOCK_MESSAGE",
+    "⛔ Запрос отклонён по соображениям безопасности.",
+).strip() or "⛔ Запрос отклонён по соображениям безопасности."
+
 BUILD_DATE = os.getenv("BUILD_DATE", "unknown")
 BUILD_SHA = os.getenv("BUILD_SHA", "")
 BOT_GROUP_ID = None
@@ -189,6 +199,8 @@ CMD_PROMPT = "/промт"
 CMD_LEADERBOARD = "/лидерборд"
 CMD_LEADERBOARD_TIMER_SET = "/таймер_лидерборда"
 CMD_LEADERBOARD_TIMER_RESET = "/сброс_таймера_лидерборда"
+CMD_BAN = "/бан"
+CMD_UNBAN = "/разбан"
 
 DB_NAME = os.getenv("DB_PATH", "chat_history.db")
 MSK_TZ = datetime.timezone(datetime.timedelta(hours=3))
@@ -269,6 +281,48 @@ def parse_llm_scope(value: str) -> str | None:
     if normalized in ("game", "игра"):
         return "game"
     return None
+
+def normalize_spaces(value: str) -> str:
+    return " ".join((value or "").strip().split())
+
+def normalize_username(value: str) -> str:
+    return normalize_spaces(value).casefold()
+
+def parse_user_id(value: str) -> int | None:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return None
+    match = re.search(r"\[id(\d+)\|", cleaned, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"@id(\d+)\b", cleaned, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.fullmatch(r"id(\d+)", cleaned, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    if cleaned.isdigit():
+        return int(cleaned)
+    return None
+
+def try_parse_json_object(value: str) -> dict | None:
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        if "{" not in value or "}" not in value:
+            return None
+        start = value.find("{")
+        end = value.rfind("}") + 1
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(value[start:end])
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
 
 SYSTEM_PROMPT = (
     "Формат ответа — строго валидный JSON, только объект и только двойные кавычки. "
@@ -520,6 +574,127 @@ async def store_message(message: Message):
     except Exception as e:
         log.exception("Failed to store message peer_id=%s user_id=%s: %s", message.peer_id, message.from_id, e)
 
+async def is_user_chatbot_banned(peer_id: int, user_id: int) -> bool:
+    if not peer_id or not user_id:
+        return False
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM chatbot_bans WHERE peer_id = ? AND user_id = ? LIMIT 1",
+            (peer_id, user_id),
+        )
+        return await cursor.fetchone() is not None
+
+async def set_chatbot_ban(peer_id: int, user_id: int, banned_by: int):
+    now_ts = int(datetime.datetime.now(MSK_TZ).timestamp())
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO chatbot_bans (peer_id, user_id, banned_by, timestamp) VALUES (?, ?, ?, ?)",
+            (peer_id, user_id, banned_by, now_ts),
+        )
+        await db.commit()
+
+async def remove_chatbot_ban(peer_id: int, user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "DELETE FROM chatbot_bans WHERE peer_id = ? AND user_id = ?",
+            (peer_id, user_id),
+        )
+        await db.commit()
+
+async def find_user_candidates_by_name(peer_id: int, raw_name: str, *, limit: int = 5) -> list[tuple[int, str, int]]:
+    name = normalize_spaces(raw_name)
+    if not name:
+        return []
+    candidates: list[tuple[int, str, int]] = []
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            """
+            SELECT user_id, username, MAX(timestamp) as last_ts
+            FROM messages
+            WHERE peer_id = ? AND username = ?
+            GROUP BY user_id, username
+            ORDER BY last_ts DESC
+            LIMIT ?
+            """,
+            (peer_id, name, limit),
+        )
+        rows = await cursor.fetchall()
+        candidates.extend([(int(uid), str(username or ""), int(last_ts or 0)) for uid, username, last_ts in rows])
+        if candidates:
+            return candidates
+
+        # Fallback: casefold match по последним сообщениям (SQLite lower() не дружит с кириллицей)
+        cursor = await db.execute(
+            """
+            SELECT user_id, username, timestamp
+            FROM messages
+            WHERE peer_id = ? AND username IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT 2000
+            """,
+            (peer_id,),
+        )
+        rows = await cursor.fetchall()
+
+    target_norm = normalize_username(name)
+    best_by_user: dict[int, tuple[str, int]] = {}
+    for uid_raw, username, ts_raw in rows:
+        if not username:
+            continue
+        if normalize_username(username) != target_norm:
+            continue
+        uid = int(uid_raw)
+        ts = int(ts_raw or 0)
+        prev = best_by_user.get(uid)
+        if prev is None or ts > prev[1]:
+            best_by_user[uid] = (str(username), ts)
+    ordered = sorted(best_by_user.items(), key=lambda item: item[1][1], reverse=True)[:limit]
+    return [(uid, data[0], data[1]) for uid, data in ordered]
+
+async def is_chat_admin(peer_id: int, user_id: int) -> bool:
+    if not peer_id or not user_id:
+        return False
+    if ADMIN_USER_ID and user_id == ADMIN_USER_ID:
+        return True
+    if peer_id < 2_000_000_000:
+        return False
+    try:
+        response = await bot.api.messages.get_conversation_members(peer_id=peer_id)
+        items = getattr(response, "items", None)
+        if items is None and isinstance(response, dict):
+            items = response.get("items")
+        if not items:
+            return False
+        for item in items:
+            member_id = getattr(item, "member_id", None)
+            if member_id is None and isinstance(item, dict):
+                member_id = item.get("member_id")
+            if member_id != user_id:
+                continue
+            is_admin = getattr(item, "is_admin", None)
+            if is_admin is None and isinstance(item, dict):
+                is_admin = item.get("is_admin")
+            is_owner = getattr(item, "is_owner", None)
+            if is_owner is None and isinstance(item, dict):
+                is_owner = item.get("is_owner")
+            return bool(is_admin or is_owner)
+    except Exception:
+        log.exception("Failed to check chat admin peer_id=%s user_id=%s", peer_id, user_id)
+    return False
+
+async def ensure_admin_only(message: Message, command: str) -> bool:
+    if await is_chat_admin(message.peer_id, message.from_id):
+        return True
+    if not ADMIN_USER_ID:
+        await send_reply(
+            message,
+            f"⛔ Команда `{command}` доступна только админам чата. "
+            "Либо задай ADMIN_USER_ID в .env для админа в ЛС.",
+        )
+    else:
+        await send_reply(message, f"⛔ Команда `{command}` доступна только админам.")
+    return False
+
 
 bot = Bot(token=VK_TOKEN)
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY and AsyncGroq else None
@@ -558,6 +733,9 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS last_winner (peer_id INTEGER PRIMARY KEY, winner_id INTEGER, timestamp INTEGER)")
         await db.execute("CREATE TABLE IF NOT EXISTS leaderboard_schedule (peer_id INTEGER PRIMARY KEY, day INTEGER, time TEXT, last_run_month TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS schedules (peer_id INTEGER PRIMARY KEY, time TEXT)")
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS chatbot_bans (peer_id INTEGER, user_id INTEGER, banned_by INTEGER, timestamp INTEGER, PRIMARY KEY (peer_id, user_id))"
+        )
         await db.commit()
 
 # ================= LLM ЗАПРОСЫ =================
@@ -571,6 +749,79 @@ def get_llm_settings(target: str) -> tuple[str, str, float, str, float]:
             CHAT_VENICE_TEMPERATURE,
         )
     return (LLM_PROVIDER, GROQ_MODEL, GROQ_TEMPERATURE, VENICE_MODEL, VENICE_TEMPERATURE)
+
+class ChatGuardBlocked(Exception):
+    def __init__(self, reason: str | None = None):
+        super().__init__(reason or "blocked")
+        self.reason = reason
+
+def build_guard_transcript(messages: list) -> str:
+    lines = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if not content:
+            continue
+        if role == "system":
+            continue
+        label = "USER" if role == "user" else "ASSISTANT"
+        lines.append(f"{label}: {content}")
+    transcript = "\n".join(lines).strip()
+    return trim_text(transcript, 3500)
+
+async def groq_chat_guard(messages: list) -> tuple[bool, str | None]:
+    if not groq_client:
+        raise RuntimeError("Groq client is not initialized")
+    transcript = build_guard_transcript(messages)
+    guard_system = (
+        "Ты модератор безопасности для чат-бота. "
+        "Твоя задача — решить, можно ли ассистенту отвечать на запрос пользователя.\n"
+        "Запрещай, если пользователь просит инструкции/советы по созданию оружия, взрывчатки, "
+        "боевых отравляющих веществ, наркотиков, взлому, насилию, и другим опасным/незаконным действиям.\n"
+        "Ответ строго валидный JSON-объект с полями:\n"
+        "{\"allow\": true|false, \"reason\": \"кратко\"}\n"
+        "Никакого текста вне JSON."
+    )
+    guard_messages = [
+        {"role": "system", "content": guard_system},
+        {"role": "user", "content": transcript or "Пустой запрос"},
+    ]
+    completion = await groq_client.chat.completions.create(
+        model=CHAT_GROQ_GUARD_MODEL,
+        messages=guard_messages,
+        temperature=0,
+        max_tokens=CHAT_GROQ_GUARD_MAX_TOKENS,
+    )
+    content = completion.choices[0].message.content or ""
+    parsed = try_parse_json_object(content)
+    if parsed is not None:
+        allow_value = parsed.get("allow")
+        reason_value = parsed.get("reason")
+        allow = allow_value is True or (isinstance(allow_value, str) and allow_value.strip().lower() == "true")
+        deny = allow_value is False or (isinstance(allow_value, str) and allow_value.strip().lower() == "false")
+        if allow:
+            return True, str(reason_value) if reason_value else None
+        if deny:
+            return False, str(reason_value) if reason_value else None
+    lowered = content.strip().lower()
+    if "unsafe" in lowered or "not allowed" in lowered or "disallow" in lowered or "block" in lowered:
+        return False, content.strip()[:200] or None
+    if "safe" in lowered or "allow" in lowered:
+        return True, content.strip()[:200] or None
+    # Fail-closed: если не смогли распарсить ответ, лучше не отвечать.
+    return False, "guard_parse_failed"
+
+async def ensure_chat_guard(messages: list):
+    provider, _, _, _, _ = get_llm_settings("chat")
+    if provider != "groq":
+        return
+    if not CHAT_GROQ_GUARD_ENABLED:
+        return
+    allowed, reason = await groq_chat_guard(messages)
+    if not allowed:
+        raise ChatGuardBlocked(reason)
 
 async def fetch_llm_messages(messages: list, max_tokens: int = None, *, target: str = "game") -> str:
     provider, groq_model, groq_temperature, venice_model, venice_temperature = get_llm_settings(target)
@@ -1115,6 +1366,9 @@ async def show_settings(message: Message):
         f"• `{CMD_SET_TEMPERATURE} [chat|game] <0.0-2.0>` - Установить температуру\n"
         f"• `{CMD_LIST_MODELS} <провайдер>` - Список моделей (Live)\n\n"
         f"• `{CMD_PROMPT}` или `{CMD_PROMPT} <текст>` - Показать/обновить user prompt\n\n"
+        f"**💬 Чатбот:**\n"
+        f"• `{CMD_BAN} Имя Фамилия` - Забанить пользователя (чатбот)\n"
+        f"• `{CMD_UNBAN} Имя Фамилия` - Разбанить пользователя (чатбот)\n\n"
         f"**🎮 Игра:**\n"
         f"• `{CMD_RUN}` - Найти пидора дня\n"
         f"• `{CMD_RESET}` - Сброс результата сегодня\n"
@@ -1125,6 +1379,97 @@ async def show_settings(message: Message):
         f"• `{CMD_LEADERBOARD_TIMER_RESET}` - Сброс таймера лидерборда"
     )
     await send_reply(message, text)
+
+@bot.on.message(StartswithRule(CMD_BAN))
+async def ban_user_handler(message: Message):
+    if not await ensure_command_allowed(message, CMD_BAN):
+        return
+    if not await ensure_admin_only(message, CMD_BAN):
+        return
+    args = strip_command(message.text, CMD_BAN)
+    target_user_id = None
+    target_name = None
+
+    reply_user_id = extract_reply_from_id(message)
+    if reply_user_id:
+        target_user_id = reply_user_id
+    if not target_user_id:
+        target_user_id = parse_user_id(args)
+    if not target_user_id:
+        candidates = await find_user_candidates_by_name(message.peer_id, args, limit=5)
+        if candidates:
+            target_user_id, target_name, _ = candidates[0]
+            if len(candidates) > 1:
+                other = ", ".join(str(uid) for uid, _, _ in candidates[1:3])
+                log.info(
+                    "Multiple ban candidates peer_id=%s name=%s chosen=%s other=%s",
+                    message.peer_id,
+                    args,
+                    target_user_id,
+                    other,
+                )
+        else:
+            await send_reply(
+                message,
+                f"❌ Не нашёл `{normalize_spaces(args)}` в базе сообщений этого чата.\n"
+                f"Попробуй так:\n"
+                f"• `{CMD_BAN} Имя Фамилия`\n"
+                f"• ответь реплаем на его сообщение и напиши `{CMD_BAN}`",
+            )
+            return
+    if target_user_id <= 0:
+        await send_reply(message, "❌ Не получилось определить user_id.")
+        return
+    if not target_name:
+        target_name = normalize_spaces(args) or f"id{target_user_id}"
+
+    await set_chatbot_ban(message.peer_id, target_user_id, message.from_id)
+    await send_reply(
+        message,
+        f"✅ Пользователь [id{target_user_id}|{target_name}] заблокирован для чатбота в этом чате.\n"
+        "🎮 Игра продолжит учитывать его сообщения.",
+    )
+
+@bot.on.message(StartswithRule(CMD_UNBAN))
+async def unban_user_handler(message: Message):
+    if not await ensure_command_allowed(message, CMD_UNBAN):
+        return
+    if not await ensure_admin_only(message, CMD_UNBAN):
+        return
+    args = strip_command(message.text, CMD_UNBAN)
+    target_user_id = None
+    target_name = None
+
+    reply_user_id = extract_reply_from_id(message)
+    if reply_user_id:
+        target_user_id = reply_user_id
+    if not target_user_id:
+        target_user_id = parse_user_id(args)
+    if not target_user_id:
+        candidates = await find_user_candidates_by_name(message.peer_id, args, limit=5)
+        if candidates:
+            target_user_id, target_name, _ = candidates[0]
+        else:
+            await send_reply(
+                message,
+                f"❌ Не нашёл `{normalize_spaces(args)}` в базе сообщений этого чата.\n"
+                f"Попробуй так:\n"
+                f"• `{CMD_UNBAN} Имя Фамилия`\n"
+                f"• ответь реплаем на его сообщение и напиши `{CMD_UNBAN}`",
+            )
+            return
+    if target_user_id <= 0:
+        await send_reply(message, "❌ Не получилось определить user_id.")
+        return
+    if not target_name:
+        target_name = normalize_spaces(args) or f"id{target_user_id}"
+
+    await remove_chatbot_ban(message.peer_id, target_user_id)
+    await send_reply(
+        message,
+        f"✅ Пользователь [id{target_user_id}|{target_name}] разбанен для чатбота в этом чате.",
+    )
+
 @bot.on.message(StartswithRule(CMD_LIST_MODELS))
 async def list_models_handler(message: Message):
     if not await ensure_command_allowed(message, CMD_LIST_MODELS):
@@ -1574,6 +1919,10 @@ async def mention_reply_handler(message: Message):
     )
     if not await ensure_message_allowed(message, action_label="чатботу"):
         return
+    if await is_user_chatbot_banned(message.peer_id, message.from_id):
+        await send_reply(message, "Вы были заблокированы")
+        log.info("Chatbot blocked user peer_id=%s user_id=%s", message.peer_id, message.from_id)
+        return
     if not CHATBOT_ENABLED:
         await send_reply(message, "💤 Чатбот отключен администратором.")
         log.info("Chatbot disabled peer_id=%s user_id=%s", message.peer_id, message.from_id)
@@ -1608,6 +1957,26 @@ async def mention_reply_handler(message: Message):
         chat_messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
         chat_messages.extend(history_messages)
         chat_messages.append({"role": "user", "content": cleaned_for_llm})
+        try:
+            await ensure_chat_guard(chat_messages)
+        except ChatGuardBlocked as blocked:
+            log.info(
+                "Chat request blocked by guard peer_id=%s user_id=%s reason=%s",
+                message.peer_id,
+                message.from_id,
+                blocked.reason,
+            )
+            await send_reply(message, CHAT_GROQ_GUARD_BLOCK_MESSAGE)
+            return
+        except Exception as e:
+            log.exception(
+                "Chat guard failed peer_id=%s user_id=%s: %s",
+                message.peer_id,
+                message.from_id,
+                e,
+            )
+            await send_reply(message, "⚠️ Не удалось проверить запрос на безопасность. Попробуй позже.")
+            return
         response_text = await fetch_llm_messages(chat_messages, max_tokens=CHAT_MAX_TOKENS, target="chat")
         response_text = trim_text(response_text, CHAT_RESPONSE_MAX_CHARS)
         if not response_text:

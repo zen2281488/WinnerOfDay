@@ -1,6 +1,7 @@
 services:
   vk-bot:
-    image: ghcr.io/zen2281488/gayofday:latest
+    build: .
+    image: gayofday-local
     container_name: gay_of_the_day_bot
     restart: unless-stopped
     # Загружаем секреты из файла .env
