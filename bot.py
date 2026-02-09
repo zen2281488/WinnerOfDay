@@ -150,37 +150,31 @@ if not VK_TOKEN:
     sys.exit(1)
 
 if LLM_PROVIDER not in ("groq", "venice"):
-    log.error("LLM_PROVIDER must be groq or venice")
-    sys.exit(1)
+    log.warning("LLM_PROVIDER must be groq or venice (got %s)", LLM_PROVIDER)
+    LLM_PROVIDER = "groq"
 
 if CHAT_LLM_PROVIDER not in ("groq", "venice"):
-    log.error("CHAT_LLM_PROVIDER must be groq or venice")
-    sys.exit(1)
+    log.warning("CHAT_LLM_PROVIDER must be groq or venice (got %s)", CHAT_LLM_PROVIDER)
+    CHAT_LLM_PROVIDER = LLM_PROVIDER
 
 if LLM_PROVIDER == "groq":
     if not GROQ_API_KEY:
-        log.error("GROQ_API_KEY is missing while LLM_PROVIDER=groq")
-        sys.exit(1)
+        log.warning("GROQ_API_KEY is missing while LLM_PROVIDER=groq (game may fall back)")
     if AsyncGroq is None:
-        log.error("groq package is not installed but LLM_PROVIDER=groq")
-        sys.exit(1)
+        log.warning("groq package is not installed but LLM_PROVIDER=groq (game may fall back)")
 else:
     if not VENICE_API_KEY:
-        log.error("VENICE_API_KEY is missing while LLM_PROVIDER=venice")
-        sys.exit(1)
+        log.warning("VENICE_API_KEY is missing while LLM_PROVIDER=venice (game may fall back)")
 
 if CHATBOT_ENABLED:
     if CHAT_LLM_PROVIDER == "groq":
         if not GROQ_API_KEY:
-            log.error("GROQ_API_KEY is missing while CHAT_LLM_PROVIDER=groq")
-            sys.exit(1)
+            log.warning("GROQ_API_KEY is missing while CHAT_LLM_PROVIDER=groq (chatbot may not work)")
         if AsyncGroq is None:
-            log.error("groq package is not installed but CHAT_LLM_PROVIDER=groq")
-            sys.exit(1)
+            log.warning("groq package is not installed but CHAT_LLM_PROVIDER=groq (chatbot may not work)")
     else:
         if not VENICE_API_KEY:
-            log.error("VENICE_API_KEY is missing while CHAT_LLM_PROVIDER=venice")
-            sys.exit(1)
+            log.warning("VENICE_API_KEY is missing while CHAT_LLM_PROVIDER=venice (chatbot may not work)")
 
 # === Команды ===
 GAME_TITLE = os.getenv("GAME_TITLE", "Пидор дня")
@@ -227,7 +221,8 @@ class StartswithRule(ABCRule[Message]):
         self.prefix = prefix.lower()
 
     async def check(self, event: Message) -> bool:
-        text = (event.text or "").strip().lower()
+        raw_text = event.text or ""
+        text = strip_bot_mention(raw_text).strip().lower()
         return text.startswith(self.prefix)
 
 class EqualsRule(ABCRule[Message]):
@@ -235,7 +230,8 @@ class EqualsRule(ABCRule[Message]):
         self.text = text.lower()
 
     async def check(self, event: Message) -> bool:
-        return (event.text or "").strip().lower() == self.text
+        raw_text = event.text or ""
+        return strip_bot_mention(raw_text).strip().lower() == self.text
 
 
 def is_chatbot_trigger_message(message: Message) -> bool:
@@ -243,6 +239,12 @@ def is_chatbot_trigger_message(message: Message) -> bool:
     if not text:
         return False
     if text.lstrip().startswith("/"):
+        return False
+    # Команды вида "@club123 /cmd" или "[club123|bot] /cmd" не должны считаться триггером чатбота.
+    if re.match(r"^\s*(?:\[(?:club|public)\d+\|[^\]]+\]|@(?:club|public)\d+)\s*/", text, flags=re.IGNORECASE):
+        return False
+    cleaned = strip_bot_mention(text)
+    if cleaned.lstrip().startswith("/"):
         return False
     reply_from_id = extract_reply_from_id(message)
     is_reply_to_bot = bool(BOT_GROUP_ID and reply_from_id == -BOT_GROUP_ID)
@@ -269,8 +271,12 @@ def strip_command(text: str, command: str) -> str:
     if not text:
         return ""
     trimmed = text.strip()
-    if trimmed.lower().startswith(command.lower()):
+    command_lower = command.lower()
+    if trimmed.lower().startswith(command_lower):
         return trimmed[len(command):].strip()
+    cleaned = strip_bot_mention(trimmed).strip()
+    if cleaned.lower().startswith(command_lower):
+        return cleaned[len(command):].strip()
     return trimmed
 
 def parse_llm_scope(value: str) -> str | None:
@@ -339,8 +345,7 @@ CHAT_SYSTEM_PROMPT = normalize_prompt(
 USER_PROMPT_TEMPLATE = normalize_prompt(os.getenv("USER_PROMPT_TEMPLATE"))
 
 if not USER_PROMPT_TEMPLATE:
-    log.error("Missing USER_PROMPT_TEMPLATE in environment")
-    sys.exit(1)
+    log.warning("USER_PROMPT_TEMPLATE is missing (will try to load from DB or /промт)")
 
 def render_user_prompt(context_text: str) -> str:
     prompt = USER_PROMPT_TEMPLATE.replace("{{GAME_TITLE}}", GAME_TITLE)
@@ -517,6 +522,13 @@ async def ensure_command_allowed(message: Message, command: str) -> bool:
 def get_reply_to_id(message: Message):
     if getattr(message, "is_unavailable", False):
         return None
+    reply_message = getattr(message, "reply_message", None)
+    reply_to = getattr(reply_message, "conversation_message_id", None)
+    if reply_to is None and isinstance(reply_message, dict):
+        reply_to = reply_message.get("conversation_message_id")
+    if isinstance(reply_to, int) and reply_to > 0:
+        return reply_to
+
     reply_to = getattr(message, "conversation_message_id", None)
     if isinstance(reply_to, int) and reply_to > 0:
         return reply_to
@@ -696,6 +708,166 @@ async def ensure_admin_only(message: Message, command: str) -> bool:
         await send_reply(message, f"⛔ Команда `{command}` доступна только админам.")
     return False
 
+def setting_to_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+def parse_setting_bool(value: str | None, default: bool) -> bool:
+    if value is None:
+        return default
+    cleaned = value.strip().lower()
+    if cleaned == "":
+        return default
+    return cleaned in TRUE_VALUES
+
+def parse_setting_float(value: str | None, default: float) -> float:
+    if value is None:
+        return default
+    cleaned = value.strip()
+    if cleaned == "":
+        return default
+    try:
+        return float(cleaned.replace(",", "."))
+    except ValueError:
+        return default
+
+def build_bot_settings_defaults() -> dict[str, str]:
+    return {
+        "LLM_PROVIDER": setting_to_text(LLM_PROVIDER),
+        "CHAT_LLM_PROVIDER": setting_to_text(CHAT_LLM_PROVIDER),
+        "GROQ_API_KEY": setting_to_text(GROQ_API_KEY),
+        "VENICE_API_KEY": setting_to_text(VENICE_API_KEY),
+        "GROQ_MODEL": setting_to_text(GROQ_MODEL),
+        "VENICE_MODEL": setting_to_text(VENICE_MODEL),
+        "GROQ_TEMPERATURE": setting_to_text(GROQ_TEMPERATURE),
+        "VENICE_TEMPERATURE": setting_to_text(VENICE_TEMPERATURE),
+        "CHAT_GROQ_MODEL": setting_to_text(CHAT_GROQ_MODEL),
+        "CHAT_VENICE_MODEL": setting_to_text(CHAT_VENICE_MODEL),
+        "CHAT_GROQ_TEMPERATURE": setting_to_text(CHAT_GROQ_TEMPERATURE),
+        "CHAT_VENICE_TEMPERATURE": setting_to_text(CHAT_VENICE_TEMPERATURE),
+        "CHATBOT_ENABLED": "1" if CHATBOT_ENABLED else "0",
+        "USER_PROMPT_TEMPLATE": setting_to_text(USER_PROMPT_TEMPLATE),
+    }
+
+async def set_bot_setting(key: str, value: str):
+    now_ts = int(datetime.datetime.now(MSK_TZ).timestamp())
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, value, now_ts),
+        )
+        await db.commit()
+
+def apply_bot_settings(settings: dict[str, str]):
+    global LLM_PROVIDER
+    global CHAT_LLM_PROVIDER
+    global GROQ_API_KEY
+    global VENICE_API_KEY
+    global GROQ_MODEL
+    global VENICE_MODEL
+    global GROQ_TEMPERATURE
+    global VENICE_TEMPERATURE
+    global CHAT_GROQ_MODEL
+    global CHAT_VENICE_MODEL
+    global CHAT_GROQ_TEMPERATURE
+    global CHAT_VENICE_TEMPERATURE
+    global CHATBOT_ENABLED
+    global USER_PROMPT_TEMPLATE
+    global groq_client
+
+    game_provider = (settings.get("LLM_PROVIDER") or "").strip().lower()
+    if game_provider in ("groq", "venice"):
+        LLM_PROVIDER = game_provider
+
+    chat_provider = (settings.get("CHAT_LLM_PROVIDER") or "").strip().lower()
+    if chat_provider in ("groq", "venice"):
+        CHAT_LLM_PROVIDER = chat_provider
+
+    groq_key = (settings.get("GROQ_API_KEY") or "").strip()
+    GROQ_API_KEY = groq_key or None
+
+    venice_key = (settings.get("VENICE_API_KEY") or "").strip()
+    VENICE_API_KEY = venice_key or None
+
+    groq_model = (settings.get("GROQ_MODEL") or "").strip()
+    if groq_model:
+        GROQ_MODEL = groq_model
+
+    venice_model = (settings.get("VENICE_MODEL") or "").strip()
+    if venice_model:
+        VENICE_MODEL = venice_model
+
+    chat_groq_model = (settings.get("CHAT_GROQ_MODEL") or "").strip()
+    if chat_groq_model:
+        CHAT_GROQ_MODEL = chat_groq_model
+
+    chat_venice_model = (settings.get("CHAT_VENICE_MODEL") or "").strip()
+    if chat_venice_model:
+        CHAT_VENICE_MODEL = chat_venice_model
+
+    GROQ_TEMPERATURE = parse_setting_float(settings.get("GROQ_TEMPERATURE"), GROQ_TEMPERATURE)
+    VENICE_TEMPERATURE = parse_setting_float(settings.get("VENICE_TEMPERATURE"), VENICE_TEMPERATURE)
+    CHAT_GROQ_TEMPERATURE = parse_setting_float(settings.get("CHAT_GROQ_TEMPERATURE"), CHAT_GROQ_TEMPERATURE)
+    CHAT_VENICE_TEMPERATURE = parse_setting_float(settings.get("CHAT_VENICE_TEMPERATURE"), CHAT_VENICE_TEMPERATURE)
+
+    CHATBOT_ENABLED = parse_setting_bool(settings.get("CHATBOT_ENABLED"), CHATBOT_ENABLED)
+
+    prompt = settings.get("USER_PROMPT_TEMPLATE")
+    if prompt is not None and prompt != "":
+        USER_PROMPT_TEMPLATE = prompt
+
+    os.environ["LLM_PROVIDER"] = LLM_PROVIDER
+    os.environ["CHAT_LLM_PROVIDER"] = CHAT_LLM_PROVIDER
+    os.environ["GROQ_MODEL"] = GROQ_MODEL
+    os.environ["VENICE_MODEL"] = VENICE_MODEL
+    os.environ["CHAT_GROQ_MODEL"] = CHAT_GROQ_MODEL
+    os.environ["CHAT_VENICE_MODEL"] = CHAT_VENICE_MODEL
+    os.environ["GROQ_TEMPERATURE"] = str(GROQ_TEMPERATURE)
+    os.environ["VENICE_TEMPERATURE"] = str(VENICE_TEMPERATURE)
+    os.environ["CHAT_GROQ_TEMPERATURE"] = str(CHAT_GROQ_TEMPERATURE)
+    os.environ["CHAT_VENICE_TEMPERATURE"] = str(CHAT_VENICE_TEMPERATURE)
+    os.environ["CHATBOT_ENABLED"] = "1" if CHATBOT_ENABLED else "0"
+    os.environ["USER_PROMPT_TEMPLATE"] = USER_PROMPT_TEMPLATE
+    if GROQ_API_KEY:
+        os.environ["GROQ_API_KEY"] = GROQ_API_KEY
+    if VENICE_API_KEY:
+        os.environ["VENICE_API_KEY"] = VENICE_API_KEY
+
+    if AsyncGroq and GROQ_API_KEY:
+        groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+    elif not GROQ_API_KEY:
+        groq_client = None
+
+async def load_bot_settings():
+    defaults = build_bot_settings_defaults()
+    now_ts = int(datetime.datetime.now(MSK_TZ).timestamp())
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("SELECT key, value FROM bot_settings")
+        rows = await cursor.fetchall()
+        existing = {str(key): ("" if value is None else str(value)) for key, value in rows}
+        if not existing:
+            for key, value in defaults.items():
+                await db.execute(
+                    "INSERT OR REPLACE INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                    (key, value, now_ts),
+                )
+            await db.commit()
+            apply_bot_settings(defaults)
+            return
+
+        for key, value in defaults.items():
+            if key in existing:
+                continue
+            await db.execute(
+                "INSERT OR REPLACE INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, value, now_ts),
+            )
+        await db.commit()
+
+    merged = {key: existing.get(key, default) for key, default in defaults.items()}
+    apply_bot_settings(merged)
+
 
 bot = Bot(token=VK_TOKEN)
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY and AsyncGroq else None
@@ -736,6 +908,9 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS schedules (peer_id INTEGER PRIMARY KEY, time TEXT)")
         await db.execute(
             "CREATE TABLE IF NOT EXISTS chatbot_bans (peer_id INTEGER, user_id INTEGER, banned_by INTEGER, timestamp INTEGER, PRIMARY KEY (peer_id, user_id))"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER)"
         )
         await db.commit()
 
@@ -1518,6 +1693,7 @@ async def chatbot_toggle_handler(message: Message):
 
     CHATBOT_ENABLED = new_state
     os.environ["CHATBOT_ENABLED"] = "1" if new_state else "0"
+    await set_bot_setting("CHATBOT_ENABLED", "1" if new_state else "0")
     log.info(
         "Chatbot toggled peer_id=%s user_id=%s enabled=%s",
         message.peer_id,
@@ -1612,13 +1788,14 @@ async def prompt_handler(message: Message):
         return
     USER_PROMPT_TEMPLATE = updated
     os.environ["USER_PROMPT_TEMPLATE"] = updated
+    await set_bot_setting("USER_PROMPT_TEMPLATE", updated)
     log.info(
         "Prompt updated peer_id=%s user_id=%s length=%s",
         message.peer_id,
         message.from_id,
         len(updated),
     )
-    await send_reply(message, "✅ USER_PROMPT_TEMPLATE обновлен (в памяти).")
+    await send_reply(message, "✅ USER_PROMPT_TEMPLATE обновлен.")
 
 # Лидерборд по текущему чату
 @bot.on.message(EqualsRule(CMD_LEADERBOARD))
@@ -1661,6 +1838,7 @@ async def set_model_handler(message: Message):
         if scope == "chat":
             CHAT_GROQ_MODEL = model_id
             os.environ["CHAT_GROQ_MODEL"] = model_id
+            await set_bot_setting("CHAT_GROQ_MODEL", model_id)
             log.info(
                 "Chat Groq model updated peer_id=%s user_id=%s model=%s",
                 message.peer_id,
@@ -1671,6 +1849,7 @@ async def set_model_handler(message: Message):
             return
         GROQ_MODEL = model_id
         os.environ["GROQ_MODEL"] = model_id
+        await set_bot_setting("GROQ_MODEL", model_id)
         log.info(
             "Game Groq model updated peer_id=%s user_id=%s model=%s",
             message.peer_id,
@@ -1682,6 +1861,7 @@ async def set_model_handler(message: Message):
     if scope == "chat":
         CHAT_VENICE_MODEL = model_id
         os.environ["CHAT_VENICE_MODEL"] = model_id
+        await set_bot_setting("CHAT_VENICE_MODEL", model_id)
         log.info(
             "Chat Venice model updated peer_id=%s user_id=%s model=%s",
             message.peer_id,
@@ -1692,6 +1872,7 @@ async def set_model_handler(message: Message):
         return
     VENICE_MODEL = model_id
     os.environ["VENICE_MODEL"] = model_id
+    await set_bot_setting("VENICE_MODEL", model_id)
     log.info(
         "Game Venice model updated peer_id=%s user_id=%s model=%s",
         message.peer_id,
@@ -1738,6 +1919,7 @@ async def set_provider_handler(message: Message):
     if scope == "chat":
         CHAT_LLM_PROVIDER = provider
         os.environ["CHAT_LLM_PROVIDER"] = provider
+        await set_bot_setting("CHAT_LLM_PROVIDER", provider)
         log.info(
             "Chat provider updated peer_id=%s user_id=%s provider=%s",
             message.peer_id,
@@ -1748,6 +1930,7 @@ async def set_provider_handler(message: Message):
         return
     LLM_PROVIDER = provider
     os.environ["LLM_PROVIDER"] = provider
+    await set_bot_setting("LLM_PROVIDER", provider)
     log.info(
         "Game provider updated peer_id=%s user_id=%s provider=%s",
         message.peer_id,
@@ -1779,6 +1962,7 @@ async def set_key_handler(message: Message):
             return
         GROQ_API_KEY = key
         os.environ["GROQ_API_KEY"] = key
+        await set_bot_setting("GROQ_API_KEY", key)
         log.info(
             "Groq API key updated peer_id=%s user_id=%s length=%s",
             message.peer_id,
@@ -1790,6 +1974,7 @@ async def set_key_handler(message: Message):
         return
     VENICE_API_KEY = key
     os.environ["VENICE_API_KEY"] = key
+    await set_bot_setting("VENICE_API_KEY", key)
     log.info(
         "Venice API key updated peer_id=%s user_id=%s length=%s",
         message.peer_id,
@@ -1831,6 +2016,7 @@ async def set_temperature_handler(message: Message):
         if CHAT_LLM_PROVIDER == "groq":
             CHAT_GROQ_TEMPERATURE = value
             os.environ["CHAT_GROQ_TEMPERATURE"] = str(value)
+            await set_bot_setting("CHAT_GROQ_TEMPERATURE", str(value))
             log.info(
                 "Chat Groq temperature updated peer_id=%s user_id=%s value=%s",
                 message.peer_id,
@@ -1841,6 +2027,7 @@ async def set_temperature_handler(message: Message):
             return
         CHAT_VENICE_TEMPERATURE = value
         os.environ["CHAT_VENICE_TEMPERATURE"] = str(value)
+        await set_bot_setting("CHAT_VENICE_TEMPERATURE", str(value))
         log.info(
             "Chat Venice temperature updated peer_id=%s user_id=%s value=%s",
             message.peer_id,
@@ -1853,6 +2040,7 @@ async def set_temperature_handler(message: Message):
     if LLM_PROVIDER == "groq":
         GROQ_TEMPERATURE = value
         os.environ["GROQ_TEMPERATURE"] = str(value)
+        await set_bot_setting("GROQ_TEMPERATURE", str(value))
         log.info(
             "Groq temperature updated peer_id=%s user_id=%s value=%s",
             message.peer_id,
@@ -1863,6 +2051,7 @@ async def set_temperature_handler(message: Message):
         return
     VENICE_TEMPERATURE = value
     os.environ["VENICE_TEMPERATURE"] = str(value)
+    await set_bot_setting("VENICE_TEMPERATURE", str(value))
     log.info(
         "Venice temperature updated peer_id=%s user_id=%s value=%s",
         message.peer_id,
@@ -1973,6 +2162,10 @@ async def mention_reply_handler(message: Message):
         and message.from_id == ADMIN_USER_ID
         and message.peer_id == message.from_id
     )
+    cleaned = text if is_admin_dm else strip_bot_mention(text)
+    # Если это команда (в т.ч. с упоминанием бота), чатбот не должен отвечать/банить.
+    if cleaned.lstrip().startswith("/"):
+        return
     if not await ensure_message_allowed(message, action_label="чатботу"):
         return
     if await is_user_chatbot_banned(message.peer_id, message.from_id):
@@ -1983,11 +2176,8 @@ async def mention_reply_handler(message: Message):
         await send_reply(message, "💤 Чатбот отключен администратором.")
         log.info("Chatbot disabled peer_id=%s user_id=%s", message.peer_id, message.from_id)
         return
-    cleaned = text if is_admin_dm else strip_bot_mention(text)
     if not cleaned:
         await send_reply(message, "Напиши сообщение после упоминания.")
-        return
-    if cleaned.lstrip().startswith("/"):
         return
     try:
         cleaned_for_llm = trim_chat_text(cleaned)
@@ -2070,6 +2260,13 @@ async def logger(message: Message):
 
 async def start_background_tasks():
     await init_db()
+    await load_bot_settings()
+    log.info(
+        "Loaded settings from DB. game_provider=%s chat_provider=%s chatbot_enabled=%s",
+        LLM_PROVIDER,
+        CHAT_LLM_PROVIDER,
+        CHATBOT_ENABLED,
+    )
     global BOT_GROUP_ID
     try:
         group_response = await bot.api.groups.get_by_id()
