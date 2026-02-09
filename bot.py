@@ -181,6 +181,7 @@ GAME_TITLE = os.getenv("GAME_TITLE", "Пидор дня")
 LEADERBOARD_TITLE = os.getenv("LEADERBOARD_TITLE", "📊 Пидерборд")
 CMD_RUN = "/кто"
 CMD_RESET = "/сброс"
+CMD_RESET_CHAT = "/сброс чат"
 CMD_TIME_SET = "/время"
 CMD_TIME_RESET = "/сброс_времени"
 CMD_SETTINGS = "/настройки"
@@ -614,6 +615,17 @@ async def remove_chatbot_ban(peer_id: int, user_id: int):
             (peer_id, user_id),
         )
         await db.commit()
+
+async def reset_user_chat_history(peer_id: int, user_id: int) -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "DELETE FROM bot_dialogs WHERE peer_id = ? AND user_id = ?",
+            (peer_id, user_id),
+        )
+        cursor = await db.execute("SELECT changes()")
+        row = await cursor.fetchone()
+        await db.commit()
+    return int(row[0]) if row else 0
 
 async def find_user_candidates_by_name(peer_id: int, raw_name: str, *, limit: int = 5) -> list[tuple[int, str, int]]:
     name = normalize_spaces(raw_name)
@@ -1531,6 +1543,7 @@ async def show_settings(message: Message):
         f"• `{CMD_PROMPT}` или `{CMD_PROMPT} <текст>` - Показать/обновить user prompt\n\n"
         f"**💬 Чатбот:**\n"
         f"• `{CMD_CHATBOT} on|off` - Включить/выключить чатбота\n"
+        f"• `{CMD_RESET_CHAT}` - Сбросить историю чатбота с тобой\n"
         f"• `{CMD_BAN} Имя Фамилия` - Забанить пользователя (чатбот)\n"
         f"• `{CMD_UNBAN} Имя Фамилия` - Разбанить пользователя (чатбот)\n\n"
         f"**🎮 Игра:**\n"
@@ -2082,6 +2095,29 @@ async def reset_daily_game(message: Message):
         await db.commit()
     log.info("Daily game reset peer_id=%s user_id=%s date=%s", peer_id, message.from_id, today)
     await send_reply(message, f"✅ Результат сброшен! Можно начинать заново.\nКоманда {CMD_RUN} снова выберет пидора дня.")
+
+@bot.on.message(StartswithRule(CMD_RESET + " "))
+async def reset_chat_history_handler(message: Message):
+    if not await ensure_command_allowed(message, CMD_RESET_CHAT):
+        return
+    args = strip_command(message.text, CMD_RESET)
+    mode = normalize_spaces(args).casefold()
+    if mode not in ("чат", "chat"):
+        await send_reply(
+            message,
+            f"❌ Не понял аргументы.\n"
+            f"Используй: `{CMD_RESET}` (сброс игры) или `{CMD_RESET_CHAT}` (сброс истории чатбота).",
+        )
+        return
+
+    deleted = await reset_user_chat_history(message.peer_id, message.from_id)
+    log.info(
+        "Chat history reset peer_id=%s user_id=%s deleted_rows=%s",
+        message.peer_id,
+        message.from_id,
+        deleted,
+    )
+    await send_reply(message, f"✅ История чатбота с тобой сброшена (удалено {deleted} сообщений).")
 
 @bot.on.message(EqualsRule(CMD_RUN))
 async def trigger_game(message: Message):
