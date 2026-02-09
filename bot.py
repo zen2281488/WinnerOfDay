@@ -70,6 +70,13 @@ def read_int_list_env(name: str):
             log.warning("%s has invalid integer: %s", name, part)
     return result
 
+def read_str_list_env(name: str):
+    value = os.getenv(name)
+    if not value:
+        return []
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    return [part for part in parts if part]
+
 ADMIN_USER_ID = read_int_env("ADMIN_USER_ID")
 ALLOWED_PEER_IDS = read_int_list_env("ALLOWED_PEER_ID")
 if not ALLOWED_PEER_IDS:
@@ -135,10 +142,20 @@ CHAT_GROQ_GUARD_MODEL = (
     os.getenv("CHAT_GROQ_GUARD_MODEL", "meta-llama/llama-guard-4-12b") or ""
 ).strip() or "meta-llama/llama-guard-4-12b"
 CHAT_GROQ_GUARD_MAX_TOKENS = read_int_env("CHAT_GROQ_GUARD_MAX_TOKENS", default=128, min_value=1)
+CHAT_GROQ_GUARD_BLOCK_CATEGORIES = read_str_list_env("CHAT_GROQ_GUARD_BLOCK_CATEGORIES")
+if not CHAT_GROQ_GUARD_BLOCK_CATEGORIES:
+    CHAT_GROQ_GUARD_BLOCK_CATEGORIES = ["S1", "S2", "S3", "S4", "S7", "S9", "S11", "S14"]
+CHAT_GROQ_GUARD_BLOCK_CATEGORIES_SET = {cat.strip().upper() for cat in CHAT_GROQ_GUARD_BLOCK_CATEGORIES if cat.strip()}
 CHAT_GROQ_GUARD_BLOCK_MESSAGE = os.getenv(
     "CHAT_GROQ_GUARD_BLOCK_MESSAGE",
     "⛔ Запрос отклонён по соображениям безопасности.",
 ).strip() or "⛔ Запрос отклонён по соображениям безопасности."
+
+CHAT_GUARD_AUTOBAN_ENABLED = read_bool_env("CHAT_GUARD_AUTOBAN_ENABLED", default=True)
+CHAT_GUARD_AUTOBAN_THRESHOLD = read_int_env("CHAT_GUARD_AUTOBAN_THRESHOLD", default=3, min_value=1) or 3
+CHAT_GUARD_AUTOBAN_WINDOW_SECONDS = read_int_env("CHAT_GUARD_AUTOBAN_WINDOW_SECONDS", default=3600, min_value=60) or 3600
+CHAT_GUARD_AUTOBAN_BASE_SECONDS = read_int_env("CHAT_GUARD_AUTOBAN_BASE_SECONDS", default=3600, min_value=60) or 3600
+CHAT_GUARD_AUTOBAN_INCREMENT_SECONDS = read_int_env("CHAT_GUARD_AUTOBAN_INCREMENT_SECONDS", default=3600, min_value=60) or 3600
 
 BUILD_DATE = os.getenv("BUILD_DATE", "unknown")
 BUILD_SHA = os.getenv("BUILD_SHA", "")
@@ -616,6 +633,108 @@ async def remove_chatbot_ban(peer_id: int, user_id: int):
         )
         await db.commit()
 
+def current_timestamp() -> int:
+    return int(datetime.datetime.now(MSK_TZ).timestamp())
+
+def format_msk_time(timestamp: int) -> str:
+    try:
+        dt = datetime.datetime.fromtimestamp(int(timestamp), tz=MSK_TZ)
+        return dt.strftime("%d.%m %H:%M")
+    except Exception:
+        return str(timestamp)
+
+def format_autoban_notice(until_ts: int) -> str:
+    remaining_sec = max(0, int(until_ts) - current_timestamp())
+    remaining_hours = max(1, int((remaining_sec + 3599) // 3600))
+    until_label = format_msk_time(until_ts)
+    return f"Вы были заблокированы (автобан на {remaining_hours} ч, до {until_label} МСК)"
+
+async def get_active_chatbot_autoban(peer_id: int, user_id: int) -> tuple[int, int] | None:
+    if not peer_id or not user_id:
+        return None
+    now_ts = current_timestamp()
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT until_ts, ban_level FROM chatbot_autobans WHERE peer_id = ? AND user_id = ? LIMIT 1",
+            (peer_id, user_id),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    until_ts = int(row[0] or 0)
+    if until_ts <= now_ts:
+        return None
+    ban_level = int(row[1] or 0)
+    return until_ts, ban_level
+
+async def clear_chatbot_autoban(peer_id: int, user_id: int):
+    if not peer_id or not user_id:
+        return
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE chatbot_autobans SET until_ts = 0 WHERE peer_id = ? AND user_id = ?",
+            (peer_id, user_id),
+        )
+        await db.commit()
+
+async def record_chat_guard_block(peer_id: int, user_id: int, categories: list[str], direction: str):
+    if not peer_id or not user_id:
+        return
+    now_ts = current_timestamp()
+    categories_text = ",".join(sorted({cat.strip().upper() for cat in (categories or []) if cat}))
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO chatbot_guard_blocks (peer_id, user_id, timestamp, direction, categories) VALUES (?, ?, ?, ?, ?)",
+            (peer_id, user_id, now_ts, direction, categories_text),
+        )
+        await db.commit()
+
+async def count_recent_chat_guard_blocks(peer_id: int, user_id: int, since_ts: int) -> int:
+    if not peer_id or not user_id:
+        return 0
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM chatbot_guard_blocks WHERE peer_id = ? AND user_id = ? AND timestamp >= ?",
+            (peer_id, user_id, int(since_ts)),
+        )
+        row = await cursor.fetchone()
+    return int(row[0]) if row else 0
+
+async def apply_chatbot_autoban(peer_id: int, user_id: int) -> tuple[int, int]:
+    now_ts = current_timestamp()
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT ban_level FROM chatbot_autobans WHERE peer_id = ? AND user_id = ? LIMIT 1",
+            (peer_id, user_id),
+        )
+        row = await cursor.fetchone()
+        prev_level = int(row[0] or 0) if row else 0
+        new_level = prev_level + 1
+        duration = CHAT_GUARD_AUTOBAN_BASE_SECONDS + max(0, new_level - 1) * CHAT_GUARD_AUTOBAN_INCREMENT_SECONDS
+        until_ts = now_ts + duration
+        await db.execute(
+            "INSERT OR REPLACE INTO chatbot_autobans (peer_id, user_id, ban_level, until_ts, last_ban_ts) VALUES (?, ?, ?, ?, ?)",
+            (peer_id, user_id, new_level, until_ts, now_ts),
+        )
+        await db.commit()
+    return until_ts, new_level
+
+async def register_guard_block_and_maybe_autoban(peer_id: int, user_id: int, categories: list[str], direction: str) -> tuple[int, int] | None:
+    categories_norm = sorted({cat.strip().upper() for cat in (categories or []) if cat and cat.strip()})
+    if not categories_norm:
+        categories_norm = ["PARSE"]
+    await record_chat_guard_block(peer_id, user_id, categories_norm, direction)
+    if not CHAT_GUARD_AUTOBAN_ENABLED:
+        return None
+    window_start = current_timestamp() - CHAT_GUARD_AUTOBAN_WINDOW_SECONDS
+    blocks = await count_recent_chat_guard_blocks(peer_id, user_id, window_start)
+    if blocks < CHAT_GUARD_AUTOBAN_THRESHOLD:
+        return None
+    active = await get_active_chatbot_autoban(peer_id, user_id)
+    if active is not None:
+        return active
+    return await apply_chatbot_autoban(peer_id, user_id)
+
 async def reset_user_chat_history(peer_id: int, user_id: int) -> int:
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -925,6 +1044,15 @@ async def init_db():
         await db.execute(
             "CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER)"
         )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS chatbot_guard_blocks (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_id INTEGER, user_id INTEGER, timestamp INTEGER, direction TEXT, categories TEXT)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chatbot_guard_blocks_peer_user_time ON chatbot_guard_blocks (peer_id, user_id, timestamp)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS chatbot_autobans (peer_id INTEGER, user_id INTEGER, ban_level INTEGER DEFAULT 0, until_ts INTEGER DEFAULT 0, last_ban_ts INTEGER, PRIMARY KEY (peer_id, user_id))"
+        )
         await db.commit()
 
 # ================= LLM ЗАПРОСЫ =================
@@ -944,6 +1072,12 @@ class ChatGuardBlocked(Exception):
         super().__init__(reason or "blocked")
         self.reason = reason
 
+def parse_guard_categories(value: str | None) -> list[str]:
+    if not value:
+        return []
+    categories = re.findall(r"\bS(?:1[0-4]|[1-9])\b", str(value), flags=re.IGNORECASE)
+    return sorted({cat.strip().upper() for cat in categories if cat and cat.strip()})
+
 def build_guard_transcript(messages: list) -> str:
     lines = []
     for msg in messages:
@@ -960,17 +1094,18 @@ def build_guard_transcript(messages: list) -> str:
     transcript = "\n".join(lines).strip()
     return trim_text(transcript, 3500)
 
-async def groq_chat_guard(messages: list) -> tuple[bool, str | None]:
+async def groq_chat_guard(messages: list) -> tuple[bool, list[str]]:
     if not groq_client:
         raise RuntimeError("Groq client is not initialized")
     transcript = build_guard_transcript(messages)
     guard_system = (
         "Ты модератор безопасности для чат-бота. "
-        "Твоя задача — решить, можно ли ассистенту отвечать на запрос пользователя.\n"
-        "Запрещай, если пользователь просит инструкции/советы по созданию оружия, взрывчатки, "
-        "боевых отравляющих веществ, наркотиков, взлому, насилию, и другим опасным/незаконным действиям.\n"
+        "Твоя задача — решить, можно ли публиковать этот контент в чате.\n"
+        "Определи, является ли контент опасным/незаконным, и какие категории нарушены.\n"
         "Ответ строго валидный JSON-объект с полями:\n"
-        "{\"allow\": true|false, \"reason\": \"кратко\"}\n"
+        "{\"allow\": true|false, \"categories\": [\"S1\"], \"reason\": \"кратко\"}\n"
+        "Категории указывай кодами MLCommons hazards taxonomy: S1..S14. "
+        "Если allow=true — categories должен быть пустым массивом.\n"
         "Никакого текста вне JSON."
     )
     guard_messages = [
@@ -984,33 +1119,98 @@ async def groq_chat_guard(messages: list) -> tuple[bool, str | None]:
         max_tokens=CHAT_GROQ_GUARD_MAX_TOKENS,
     )
     content = completion.choices[0].message.content or ""
+    categories: list[str] = []
+
+    def normalize_categories(items) -> list[str]:
+        if not items:
+            return []
+        found: list[str] = []
+        if isinstance(items, str):
+            candidates = re.findall(r"\bS(?:1[0-4]|[1-9])\b", items, flags=re.IGNORECASE)
+            found.extend(candidates)
+        elif isinstance(items, list):
+            for item in items:
+                if item is None:
+                    continue
+                text = str(item)
+                candidates = re.findall(r"\bS(?:1[0-4]|[1-9])\b", text, flags=re.IGNORECASE)
+                found.extend(candidates)
+        unique = sorted({cat.strip().upper() for cat in found if cat.strip()})
+        return unique
+
+    def parse_bool(value) -> bool | None:
+        if value is True:
+            return True
+        if value is False:
+            return False
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("true", "1", "yes", "y"):
+                return True
+            if normalized in ("false", "0", "no", "n"):
+                return False
+        return None
+
     parsed = try_parse_json_object(content)
     if parsed is not None:
         allow_value = parsed.get("allow")
         reason_value = parsed.get("reason")
-        allow = allow_value is True or (isinstance(allow_value, str) and allow_value.strip().lower() == "true")
-        deny = allow_value is False or (isinstance(allow_value, str) and allow_value.strip().lower() == "false")
-        if allow:
-            return True, str(reason_value) if reason_value else None
-        if deny:
-            return False, str(reason_value) if reason_value else None
-    lowered = content.strip().lower()
+        categories = normalize_categories(
+            parsed.get("categories")
+            or parsed.get("category")
+            or parsed.get("violations")
+            or parsed.get("hazards")
+        )
+        if not categories and reason_value:
+            categories = normalize_categories(reason_value)
+
+        allow_flag = parse_bool(allow_value)
+        if allow_flag is True:
+            return True, []
+        if allow_flag is False:
+            return False, categories
+
+        # Иногда model возвращает JSON без allow. Пытаемся извлечь сигнал из других полей.
+        for key in ("safe", "is_safe", "allowed"):
+            alt = parse_bool(parsed.get(key))
+            if alt is True:
+                return True, []
+        for key in ("unsafe", "is_unsafe", "blocked", "deny", "disallow"):
+            alt = parse_bool(parsed.get(key))
+            if alt is False:
+                return False, categories
+
+        # Если есть категории — трактуем как блок.
+        if categories:
+            return False, categories
+
+    stripped = content.strip()
+    lowered = stripped.lower()
+    if lowered.startswith("safe"):
+        return True, []
+    if lowered.startswith("unsafe"):
+        categories = normalize_categories(stripped)
+        return False, categories
     if "unsafe" in lowered or "not allowed" in lowered or "disallow" in lowered or "block" in lowered:
-        return False, content.strip()[:200] or None
+        categories = normalize_categories(stripped)
+        return False, categories
     if "safe" in lowered or "allow" in lowered:
-        return True, content.strip()[:200] or None
+        return True, []
+
     # Fail-closed: если не смогли распарсить ответ, лучше не отвечать.
-    return False, "guard_parse_failed"
+    return False, []
 
 async def ensure_chat_guard(messages: list):
-    provider, _, _, _, _ = get_llm_settings("chat")
-    if provider != "groq":
-        return
     if not CHAT_GROQ_GUARD_ENABLED:
         return
-    allowed, reason = await groq_chat_guard(messages)
-    if not allowed:
-        raise ChatGuardBlocked(reason)
+    allowed, categories = await groq_chat_guard(messages)
+    if allowed:
+        return
+    if not categories:
+        raise ChatGuardBlocked("guard_parse_failed")
+    matched = sorted(set(categories) & CHAT_GROQ_GUARD_BLOCK_CATEGORIES_SET)
+    if matched:
+        raise ChatGuardBlocked(",".join(matched))
 
 async def fetch_llm_messages(messages: list, max_tokens: int = None, *, target: str = "game") -> str:
     provider, groq_model, groq_temperature, venice_model, venice_temperature = get_llm_settings(target)
@@ -1486,6 +1686,15 @@ async def show_settings(message: Message):
     game_venice_marker = " ✅" if LLM_PROVIDER == "venice" else ""
     chat_groq_marker = " ✅" if CHAT_LLM_PROVIDER == "groq" else ""
     chat_venice_marker = " ✅" if CHAT_LLM_PROVIDER == "venice" else ""
+    guard_status = "on" if CHAT_GROQ_GUARD_ENABLED else "off"
+    guard_categories = ", ".join(sorted(CHAT_GROQ_GUARD_BLOCK_CATEGORIES_SET)) or "—"
+    autoban_status = "on" if CHAT_GUARD_AUTOBAN_ENABLED else "off"
+    autoban_window_min = max(1, int(CHAT_GUARD_AUTOBAN_WINDOW_SECONDS // 60))
+    autoban_base_min = max(1, int(CHAT_GUARD_AUTOBAN_BASE_SECONDS // 60))
+    autoban_inc_min = max(1, int(CHAT_GUARD_AUTOBAN_INCREMENT_SECONDS // 60))
+    autoban_line = (
+        f"{CHAT_GUARD_AUTOBAN_THRESHOLD} блок(а) за {autoban_window_min} мин → бан {autoban_base_min} мин (+{autoban_inc_min} мин/повтор)"
+    )
     if ALLOWED_PEER_IDS is None:
         access_line = "без ограничений"
     else:
@@ -1527,6 +1736,8 @@ async def show_settings(message: Message):
         f"• groq: `{CHAT_GROQ_MODEL}` (t `{CHAT_GROQ_TEMPERATURE}`){chat_groq_marker}\n"
         f"• venice: `{CHAT_VENICE_MODEL}` (t `{CHAT_VENICE_TEMPERATURE}`){chat_venice_marker}\n\n"
         f"🔑 **Ключи:** groq `{groq_key_short}`, venice `{venice_key_short}`\n\n"
+        f"🛡 **Groq Guard (чат):** `{guard_status}`, блок: `{guard_categories}`\n\n"
+        f"🚫 **Автобан (guard):** `{autoban_status}` — {autoban_line}\n\n"
         f"📦 **Провайдеры:** `groq`, `venice`\n"
         f"🔒 **Доступ:** {access_line}\n"
         f"🧭 **Peer ID:** `{message.peer_id}`\n"
@@ -1642,6 +1853,7 @@ async def unban_user_handler(message: Message):
         target_name = normalize_spaces(args) or f"id{target_user_id}"
 
     await remove_chatbot_ban(message.peer_id, target_user_id)
+    await clear_chatbot_autoban(message.peer_id, target_user_id)
     await send_reply(
         message,
         f"✅ Пользователь [id{target_user_id}|{target_name}] разбанен для чатбота в этом чате.",
@@ -2219,6 +2431,18 @@ async def mention_reply_handler(message: Message):
         await send_reply(message, "Вы были заблокированы")
         log.info("Chatbot blocked user peer_id=%s user_id=%s", message.peer_id, message.from_id)
         return
+    autoban = await get_active_chatbot_autoban(message.peer_id, message.from_id)
+    if autoban is not None:
+        until_ts, ban_level = autoban
+        await send_reply(message, format_autoban_notice(until_ts))
+        log.info(
+            "Chatbot autobanned user peer_id=%s user_id=%s until=%s level=%s",
+            message.peer_id,
+            message.from_id,
+            until_ts,
+            ban_level,
+        )
+        return
     if not CHATBOT_ENABLED:
         await send_reply(message, "💤 Чатбот отключен администратором.")
         log.info("Chatbot disabled peer_id=%s user_id=%s", message.peer_id, message.from_id)
@@ -2259,6 +2483,17 @@ async def mention_reply_handler(message: Message):
                 message.from_id,
                 blocked.reason,
             )
+            categories = parse_guard_categories(blocked.reason)
+            autoban_info = await register_guard_block_and_maybe_autoban(
+                message.peer_id,
+                message.from_id,
+                categories,
+                direction="input",
+            )
+            if autoban_info is not None:
+                until_ts, _ = autoban_info
+                await send_reply(message, format_autoban_notice(until_ts))
+                return
             await send_reply(message, CHAT_GROQ_GUARD_BLOCK_MESSAGE)
             return
         except Exception as e:
@@ -2274,6 +2509,37 @@ async def mention_reply_handler(message: Message):
         response_text = trim_text(response_text, CHAT_RESPONSE_MAX_CHARS)
         if not response_text:
             await send_reply(message, "❌ Ответ получился пустым. Попробуй позже.")
+            return
+        try:
+            await ensure_chat_guard([{"role": "assistant", "content": response_text}])
+        except ChatGuardBlocked as blocked:
+            log.info(
+                "Chat response blocked by guard peer_id=%s user_id=%s reason=%s",
+                message.peer_id,
+                message.from_id,
+                blocked.reason,
+            )
+            categories = parse_guard_categories(blocked.reason)
+            autoban_info = await register_guard_block_and_maybe_autoban(
+                message.peer_id,
+                message.from_id,
+                categories,
+                direction="output",
+            )
+            if autoban_info is not None:
+                until_ts, _ = autoban_info
+                await send_reply(message, format_autoban_notice(until_ts))
+                return
+            await send_reply(message, CHAT_GROQ_GUARD_BLOCK_MESSAGE)
+            return
+        except Exception as e:
+            log.exception(
+                "Chat output guard failed peer_id=%s user_id=%s: %s",
+                message.peer_id,
+                message.from_id,
+                e,
+            )
+            await send_reply(message, "⚠️ Не удалось проверить ответ на безопасность. Попробуй позже.")
             return
         log.debug(
             "Chatbot response peer_id=%s user_id=%s chars=%s",
