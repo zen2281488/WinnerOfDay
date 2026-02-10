@@ -314,17 +314,23 @@ BUILD_DATE = os.getenv("BUILD_DATE", "unknown")
 BUILD_SHA = os.getenv("BUILD_SHA", "")
 BOT_GROUP_ID = None
 USER_NAME_CACHE: dict[int, str] = {}
+USER_NAME_CACHE_LAST_SEEN_TS: dict[int, int] = {}
 LAST_BOT_MESSAGE_TS_BY_PEER: dict[int, int] = {}
 MESSAGES_SINCE_BOT_BY_PEER: dict[int, int] = {}
 PROACTIVE_LOCKS: dict[int, asyncio.Lock] = {}
 LAST_REACTION_TS_BY_PEER: dict[int, int] = {}
 LAST_REACTION_CMID_BY_PEER: dict[int, int] = {}
+CHAT_SUMMARY_CACHE_BY_PEER: dict[int, tuple[str, int, int, int]] = {}
+CHAT_SUMMARY_CACHE_LAST_ACCESS_TS: dict[int, int] = {}
 CHAT_SUMMARY_PENDING_BY_PEER: dict[int, int] = {}
 CHAT_SUMMARY_LAST_TRIGGER_TS_BY_PEER: dict[int, int] = {}
 CHAT_SUMMARY_LOCKS: dict[int, asyncio.Lock] = {}
+USER_MEMORY_CACHE_BY_KEY: dict[tuple[int, int], tuple[str, int, int, int]] = {}
+USER_MEMORY_CACHE_LAST_ACCESS_TS: dict[tuple[int, int], int] = {}
 USER_MEMORY_PENDING_BY_KEY: dict[tuple[int, int], int] = {}
 USER_MEMORY_LAST_TRIGGER_TS_BY_KEY: dict[tuple[int, int], int] = {}
 USER_MEMORY_LOCKS_BY_KEY: dict[tuple[int, int], asyncio.Lock] = {}
+NEXT_RUNTIME_MAINTENANCE_TS = 0
 _CHATBOT_PROACTIVE_GUARD_WARNED = False
 
 if not VK_TOKEN:
@@ -385,6 +391,51 @@ CMD_MEMORY = "/память"
 
 DB_NAME = os.getenv("DB_PATH", "chat_history.db")
 MSK_TZ = datetime.timezone(datetime.timedelta(hours=3))
+
+# Runtime maintenance / retention tuning.
+RUNTIME_MAINTENANCE_INTERVAL_SECONDS = read_int_env(
+    "RUNTIME_MAINTENANCE_INTERVAL_SECONDS",
+    default=900,
+    min_value=60,
+)
+if RUNTIME_MAINTENANCE_INTERVAL_SECONDS is None:
+    RUNTIME_MAINTENANCE_INTERVAL_SECONDS = 900
+
+RUNTIME_CACHE_MAX_USERS = read_int_env("RUNTIME_CACHE_MAX_USERS", default=5000, min_value=100)
+if RUNTIME_CACHE_MAX_USERS is None:
+    RUNTIME_CACHE_MAX_USERS = 5000
+
+RUNTIME_CACHE_MAX_SUMMARIES = read_int_env("RUNTIME_CACHE_MAX_SUMMARIES", default=3000, min_value=100)
+if RUNTIME_CACHE_MAX_SUMMARIES is None:
+    RUNTIME_CACHE_MAX_SUMMARIES = 3000
+
+RUNTIME_CACHE_MAX_USER_MEMORIES = read_int_env("RUNTIME_CACHE_MAX_USER_MEMORIES", default=6000, min_value=100)
+if RUNTIME_CACHE_MAX_USER_MEMORIES is None:
+    RUNTIME_CACHE_MAX_USER_MEMORIES = 6000
+
+RUNTIME_CACHE_MAX_STATE_KEYS = read_int_env("RUNTIME_CACHE_MAX_STATE_KEYS", default=6000, min_value=100)
+if RUNTIME_CACHE_MAX_STATE_KEYS is None:
+    RUNTIME_CACHE_MAX_STATE_KEYS = 6000
+
+MESSAGES_RETENTION_DAYS = read_int_env("MESSAGES_RETENTION_DAYS", default=30, min_value=0)
+if MESSAGES_RETENTION_DAYS is None:
+    MESSAGES_RETENTION_DAYS = 30
+
+BOT_DIALOGS_RETENTION_DAYS = read_int_env("BOT_DIALOGS_RETENTION_DAYS", default=30, min_value=0)
+if BOT_DIALOGS_RETENTION_DAYS is None:
+    BOT_DIALOGS_RETENTION_DAYS = 30
+
+CHAT_GUARD_BLOCKS_RETENTION_DAYS = read_int_env("CHAT_GUARD_BLOCKS_RETENTION_DAYS", default=30, min_value=0)
+if CHAT_GUARD_BLOCKS_RETENTION_DAYS is None:
+    CHAT_GUARD_BLOCKS_RETENTION_DAYS = 30
+
+CHAT_SUMMARY_RETENTION_DAYS = read_int_env("CHAT_SUMMARY_RETENTION_DAYS", default=90, min_value=0)
+if CHAT_SUMMARY_RETENTION_DAYS is None:
+    CHAT_SUMMARY_RETENTION_DAYS = 90
+
+USER_MEMORY_RETENTION_DAYS = read_int_env("USER_MEMORY_RETENTION_DAYS", default=120, min_value=0)
+if USER_MEMORY_RETENTION_DAYS is None:
+    USER_MEMORY_RETENTION_DAYS = 120
 
 def format_build_date(value: str) -> str:
     if not value or value == "unknown":
@@ -632,6 +683,61 @@ def trim_text_middle(text: str, max_chars: int, *, sep: str = " ... ") -> str:
     head = (max_chars - len(sep)) // 2
     tail = max_chars - len(sep) - head
     return f"{cleaned[:head].rstrip()}{sep}{cleaned[-tail:].lstrip()}"
+
+
+def strip_reasoning_leak(text: str) -> str:
+    """Best-effort: hide chain-of-thought / analysis templates if a reasoning model leaks them into visible output."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+
+    lowered = cleaned.casefold()
+    markers = (
+        "analyze the user's input",
+        "determine the response strategy",
+        "internal monologue",
+        "constraint checklist",
+        "confidence score",
+        "chain-of-thought",
+        "(@draft)",
+    )
+    if not any(marker in lowered for marker in markers):
+        return cleaned
+
+    # Try to cut to the final part after common "final/draft/answer" markers.
+    cut_patterns = (
+        r"\(\s*@?draft\s*\)",
+        r"\*\*\s*draft\b",
+        r"\bdraft\b\s*:",
+        r"\bfinal\s+answer\b\s*:",
+        r"\bfinal\b\s*:",
+        r"\banswer\b\s*:",
+        r"\bответ\b\s*:",
+    )
+    last_match = None
+    combined = re.compile(r"(?is)" + "|".join(cut_patterns))
+    for match in combined.finditer(cleaned):
+        last_match = match
+    if last_match is not None:
+        candidate = cleaned[last_match.end() :].strip()
+    else:
+        candidate = ""
+
+    # Fallback: take last paragraph if it doesn't look like the analysis template itself.
+    if not candidate:
+        paragraphs = [part.strip() for part in re.split(r"\n{2,}", cleaned) if part.strip()]
+        if paragraphs:
+            candidate = paragraphs[-1]
+
+    candidate = (candidate or "").strip()
+    if not candidate:
+        return cleaned
+
+    # Clean up common prefixes like "@id... (@Draft) 1:*..."
+    candidate = re.sub(r"^\s*@?id\d+\s*\([^\)]*\)\s*", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"^\s*\d+\s*[\)\.:]\s*", "", candidate)
+    candidate = candidate.strip(" \n\r\t:-*")
+    return candidate if candidate else cleaned
 
 def split_text_for_sending(
     text: str,
@@ -962,6 +1068,11 @@ async def load_chat_summary(peer_id: int) -> tuple[str, int, int, int]:
     """Returns (summary, updated_at, last_conversation_message_id, last_timestamp)."""
     if not peer_id:
         return ("", 0, 0, 0)
+    peer_key = int(peer_id)
+    cached = CHAT_SUMMARY_CACHE_BY_PEER.get(peer_key)
+    if cached is not None:
+        CHAT_SUMMARY_CACHE_LAST_ACCESS_TS[peer_key] = current_timestamp()
+        return cached
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
             """
@@ -970,20 +1081,27 @@ async def load_chat_summary(peer_id: int) -> tuple[str, int, int, int]:
             WHERE peer_id = ?
             LIMIT 1
             """,
-            (int(peer_id),),
+            (peer_key,),
         )
         row = await cursor.fetchone()
     if not row:
-        return ("", 0, 0, 0)
+        empty = ("", 0, 0, 0)
+        CHAT_SUMMARY_CACHE_BY_PEER[peer_key] = empty
+        CHAT_SUMMARY_CACHE_LAST_ACCESS_TS[peer_key] = current_timestamp()
+        return empty
     summary, updated_at, last_conv_id, last_ts = row
-    return (
+    loaded = (
         str(summary or ""),
         int(updated_at or 0),
         int(last_conv_id or 0),
         int(last_ts or 0),
     )
+    CHAT_SUMMARY_CACHE_BY_PEER[peer_key] = loaded
+    CHAT_SUMMARY_CACHE_LAST_ACCESS_TS[peer_key] = current_timestamp()
+    return loaded
 
 async def save_chat_summary(peer_id: int, summary: str, last_conv_id: int, last_ts: int):
+    peer_key = int(peer_id)
     now_ts = current_timestamp()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -991,9 +1109,16 @@ async def save_chat_summary(peer_id: int, summary: str, last_conv_id: int, last_
             INSERT OR REPLACE INTO chat_summary (peer_id, summary, updated_at, last_conversation_message_id, last_timestamp)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (int(peer_id), str(summary or ""), int(now_ts), int(last_conv_id or 0), int(last_ts or 0)),
+            (peer_key, str(summary or ""), int(now_ts), int(last_conv_id or 0), int(last_ts or 0)),
         )
         await db.commit()
+    CHAT_SUMMARY_CACHE_BY_PEER[peer_key] = (
+        str(summary or ""),
+        int(now_ts),
+        int(last_conv_id or 0),
+        int(last_ts or 0),
+    )
+    CHAT_SUMMARY_CACHE_LAST_ACCESS_TS[peer_key] = int(now_ts)
 
 async def fetch_messages_for_summary_bootstrap(peer_id: int, limit: int) -> list[tuple[int, str, str, int, int]]:
     if not peer_id or limit <= 0:
@@ -1181,6 +1306,11 @@ async def load_user_memory(peer_id: int, user_id: int) -> tuple[str, int, int, i
     """Returns (summary, updated_at, last_conversation_message_id, last_timestamp)."""
     if not peer_id or not user_id:
         return ("", 0, 0, 0)
+    key = (int(peer_id), int(user_id))
+    cached = USER_MEMORY_CACHE_BY_KEY.get(key)
+    if cached is not None:
+        USER_MEMORY_CACHE_LAST_ACCESS_TS[key] = current_timestamp()
+        return cached
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
             """
@@ -1189,20 +1319,27 @@ async def load_user_memory(peer_id: int, user_id: int) -> tuple[str, int, int, i
             WHERE peer_id = ? AND user_id = ?
             LIMIT 1
             """,
-            (int(peer_id), int(user_id)),
+            key,
         )
         row = await cursor.fetchone()
     if not row:
-        return ("", 0, 0, 0)
+        empty = ("", 0, 0, 0)
+        USER_MEMORY_CACHE_BY_KEY[key] = empty
+        USER_MEMORY_CACHE_LAST_ACCESS_TS[key] = current_timestamp()
+        return empty
     summary, updated_at, last_conv_id, last_ts = row
-    return (
+    loaded = (
         str(summary or ""),
         int(updated_at or 0),
         int(last_conv_id or 0),
         int(last_ts or 0),
     )
+    USER_MEMORY_CACHE_BY_KEY[key] = loaded
+    USER_MEMORY_CACHE_LAST_ACCESS_TS[key] = current_timestamp()
+    return loaded
 
 async def save_user_memory(peer_id: int, user_id: int, summary: str, last_conv_id: int, last_ts: int):
+    key = (int(peer_id), int(user_id))
     now_ts = current_timestamp()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -1211,8 +1348,8 @@ async def save_user_memory(peer_id: int, user_id: int, summary: str, last_conv_i
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                int(peer_id),
-                int(user_id),
+                key[0],
+                key[1],
                 str(summary or ""),
                 int(now_ts),
                 int(last_conv_id or 0),
@@ -1220,16 +1357,26 @@ async def save_user_memory(peer_id: int, user_id: int, summary: str, last_conv_i
             ),
         )
         await db.commit()
+    USER_MEMORY_CACHE_BY_KEY[key] = (
+        str(summary or ""),
+        int(now_ts),
+        int(last_conv_id or 0),
+        int(last_ts or 0),
+    )
+    USER_MEMORY_CACHE_LAST_ACCESS_TS[key] = int(now_ts)
 
 async def clear_user_memory(peer_id: int, user_id: int) -> int:
+    key = (int(peer_id), int(user_id))
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             "DELETE FROM user_memory WHERE peer_id = ? AND user_id = ?",
-            (int(peer_id), int(user_id)),
+            key,
         )
         cursor = await db.execute("SELECT changes()")
         row = await cursor.fetchone()
         await db.commit()
+    USER_MEMORY_CACHE_BY_KEY.pop(key, None)
+    USER_MEMORY_CACHE_LAST_ACCESS_TS.pop(key, None)
     return int(row[0]) if row else 0
 
 async def fetch_user_messages_bootstrap(peer_id: int, user_id: int, limit: int) -> list[tuple[str, int, int]]:
@@ -1676,6 +1823,7 @@ async def store_message(message: Message):
             return
         if message.from_id is None or message.from_id <= 0:
             return
+        now_ts = int(message.date or current_timestamp())
         text = getattr(message, "text", None)
         if text is None:
             return
@@ -1688,11 +1836,12 @@ async def store_message(message: Message):
                 log.debug("Failed to resolve username user_id=%s: %s", message.from_id, e)
                 username = "Unknown"
             USER_NAME_CACHE[message.from_id] = username
+        USER_NAME_CACHE_LAST_SEEN_TS[int(message.from_id)] = now_ts
         conversation_message_id = get_conversation_message_id(message)
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute(
                 "INSERT OR IGNORE INTO messages (user_id, peer_id, text, timestamp, username, conversation_message_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (message.from_id, message.peer_id, text, message.date, username, conversation_message_id),
+                (message.from_id, message.peer_id, text, now_ts, username, conversation_message_id),
             )
             await db.commit()
     except Exception as e:
@@ -1734,6 +1883,217 @@ def format_msk_time(timestamp: int) -> str:
         return dt.strftime("%d.%m %H:%M")
     except Exception:
         return str(timestamp)
+
+def _retention_cutoff_ts(days: int, now_ts: int) -> int | None:
+    if not days or int(days) <= 0:
+        return None
+    return int(now_ts) - int(days) * 24 * 3600
+
+def _trim_dict_by_score(data: dict, score: dict, max_size: int) -> list:
+    size = len(data)
+    if max_size <= 0:
+        removed = list(data.keys())
+        data.clear()
+        score.clear()
+        return removed
+    if size <= max_size:
+        return []
+    remove_count = size - max_size
+    ordered_keys = sorted(data.keys(), key=lambda key: int(score.get(key, 0) or 0))
+    removed = ordered_keys[:remove_count]
+    for key in removed:
+        data.pop(key, None)
+        score.pop(key, None)
+    return removed
+
+def cleanup_runtime_caches(now_ts: int | None = None) -> dict[str, int]:
+    now_ts = int(now_ts or current_timestamp())
+    stats = {
+        "username_cache_pruned": 0,
+        "chat_summary_cache_pruned": 0,
+        "user_memory_cache_pruned": 0,
+        "chat_summary_state_pruned": 0,
+        "user_memory_state_pruned": 0,
+    }
+
+    removed_usernames = _trim_dict_by_score(
+        USER_NAME_CACHE,
+        USER_NAME_CACHE_LAST_SEEN_TS,
+        int(RUNTIME_CACHE_MAX_USERS),
+    )
+    stats["username_cache_pruned"] = len(removed_usernames)
+
+    removed_summary_cache = _trim_dict_by_score(
+        CHAT_SUMMARY_CACHE_BY_PEER,
+        CHAT_SUMMARY_CACHE_LAST_ACCESS_TS,
+        int(RUNTIME_CACHE_MAX_SUMMARIES),
+    )
+    stats["chat_summary_cache_pruned"] = len(removed_summary_cache)
+
+    removed_user_memory_cache = _trim_dict_by_score(
+        USER_MEMORY_CACHE_BY_KEY,
+        USER_MEMORY_CACHE_LAST_ACCESS_TS,
+        int(RUNTIME_CACHE_MAX_USER_MEMORIES),
+    )
+    stats["user_memory_cache_pruned"] = len(removed_user_memory_cache)
+
+    summary_state_keys = set(CHAT_SUMMARY_PENDING_BY_PEER.keys()) | set(CHAT_SUMMARY_LAST_TRIGGER_TS_BY_PEER.keys())
+    if len(summary_state_keys) > int(RUNTIME_CACHE_MAX_STATE_KEYS):
+        remove_count = len(summary_state_keys) - int(RUNTIME_CACHE_MAX_STATE_KEYS)
+        keys = sorted(
+            summary_state_keys,
+            key=lambda key: int(CHAT_SUMMARY_LAST_TRIGGER_TS_BY_PEER.get(key, 0) or 0),
+        )
+        removed_state = 0
+        for key in keys:
+            if removed_state >= remove_count:
+                break
+            lock = CHAT_SUMMARY_LOCKS.get(key)
+            if lock is not None and lock.locked():
+                continue
+            CHAT_SUMMARY_LAST_TRIGGER_TS_BY_PEER.pop(key, None)
+            CHAT_SUMMARY_PENDING_BY_PEER.pop(key, None)
+            CHAT_SUMMARY_LOCKS.pop(key, None)
+            removed_state += 1
+        stats["chat_summary_state_pruned"] = removed_state
+
+    user_memory_state_keys = set(USER_MEMORY_PENDING_BY_KEY.keys()) | set(USER_MEMORY_LAST_TRIGGER_TS_BY_KEY.keys())
+    if len(user_memory_state_keys) > int(RUNTIME_CACHE_MAX_STATE_KEYS):
+        remove_count = len(user_memory_state_keys) - int(RUNTIME_CACHE_MAX_STATE_KEYS)
+        keys = sorted(
+            user_memory_state_keys,
+            key=lambda key: int(USER_MEMORY_LAST_TRIGGER_TS_BY_KEY.get(key, 0) or 0),
+        )
+        removed_state = 0
+        for key in keys:
+            if removed_state >= remove_count:
+                break
+            lock = USER_MEMORY_LOCKS_BY_KEY.get(key)
+            if lock is not None and lock.locked():
+                continue
+            USER_MEMORY_LAST_TRIGGER_TS_BY_KEY.pop(key, None)
+            USER_MEMORY_PENDING_BY_KEY.pop(key, None)
+            USER_MEMORY_LOCKS_BY_KEY.pop(key, None)
+            removed_state += 1
+        stats["user_memory_state_pruned"] = removed_state
+
+    return stats
+
+async def cleanup_db_retention(now_ts: int | None = None) -> dict[str, int]:
+    now_ts = int(now_ts or current_timestamp())
+    summary_cutoff = _retention_cutoff_ts(CHAT_SUMMARY_RETENTION_DAYS, now_ts)
+    memory_cutoff = _retention_cutoff_ts(USER_MEMORY_RETENTION_DAYS, now_ts)
+    delete_specs: list[tuple[str, str, tuple]] = []
+
+    messages_cutoff = _retention_cutoff_ts(MESSAGES_RETENTION_DAYS, now_ts)
+    if messages_cutoff is not None:
+        delete_specs.append(
+            (
+                "messages_deleted",
+                "DELETE FROM messages WHERE timestamp > 0 AND timestamp < ?",
+                (int(messages_cutoff),),
+            )
+        )
+
+    dialogs_cutoff = _retention_cutoff_ts(BOT_DIALOGS_RETENTION_DAYS, now_ts)
+    if dialogs_cutoff is not None:
+        delete_specs.append(
+            (
+                "bot_dialogs_deleted",
+                "DELETE FROM bot_dialogs WHERE timestamp > 0 AND timestamp < ?",
+                (int(dialogs_cutoff),),
+            )
+        )
+
+    guard_cutoff = _retention_cutoff_ts(CHAT_GUARD_BLOCKS_RETENTION_DAYS, now_ts)
+    if guard_cutoff is not None:
+        delete_specs.append(
+            (
+                "chat_guard_blocks_deleted",
+                "DELETE FROM chatbot_guard_blocks WHERE timestamp > 0 AND timestamp < ?",
+                (int(guard_cutoff),),
+            )
+        )
+
+    if summary_cutoff is not None:
+        delete_specs.append(
+            (
+                "chat_summary_deleted",
+                "DELETE FROM chat_summary WHERE last_timestamp > 0 AND last_timestamp < ?",
+                (int(summary_cutoff),),
+            )
+        )
+
+    if memory_cutoff is not None:
+        delete_specs.append(
+            (
+                "user_memory_deleted",
+                "DELETE FROM user_memory WHERE last_timestamp > 0 AND last_timestamp < ?",
+                (int(memory_cutoff),),
+            )
+        )
+
+    stats = {
+        "messages_deleted": 0,
+        "bot_dialogs_deleted": 0,
+        "chat_guard_blocks_deleted": 0,
+        "chat_summary_deleted": 0,
+        "user_memory_deleted": 0,
+    }
+    if not delete_specs:
+        return stats
+
+    total_changes = 0
+    async with aiosqlite.connect(DB_NAME) as db:
+        for label, query, params in delete_specs:
+            await db.execute(query, params)
+            cursor = await db.execute("SELECT changes()")
+            row = await cursor.fetchone()
+            changed = int(row[0] or 0) if row else 0
+            stats[label] = changed
+            total_changes += changed
+        if total_changes > 0:
+            await db.commit()
+
+    # Keep in-memory mirrors consistent with potential DB cleanup.
+    if summary_cutoff is not None:
+        stale_peer_ids = [
+            peer_id
+            for peer_id, value in CHAT_SUMMARY_CACHE_BY_PEER.items()
+            if int(value[3] or 0) > 0 and int(value[3] or 0) < int(summary_cutoff)
+        ]
+        for peer_id in stale_peer_ids:
+            CHAT_SUMMARY_CACHE_BY_PEER.pop(peer_id, None)
+            CHAT_SUMMARY_CACHE_LAST_ACCESS_TS.pop(peer_id, None)
+
+    if memory_cutoff is not None:
+        stale_keys = [
+            key
+            for key, value in USER_MEMORY_CACHE_BY_KEY.items()
+            if int(value[3] or 0) > 0 and int(value[3] or 0) < int(memory_cutoff)
+        ]
+        for key in stale_keys:
+            USER_MEMORY_CACHE_BY_KEY.pop(key, None)
+            USER_MEMORY_CACHE_LAST_ACCESS_TS.pop(key, None)
+
+    return stats
+
+async def run_runtime_maintenance(force: bool = False):
+    global NEXT_RUNTIME_MAINTENANCE_TS
+    now_ts = current_timestamp()
+    if not force and now_ts < int(NEXT_RUNTIME_MAINTENANCE_TS or 0):
+        return
+    NEXT_RUNTIME_MAINTENANCE_TS = now_ts + int(RUNTIME_MAINTENANCE_INTERVAL_SECONDS or 900)
+    runtime_stats = cleanup_runtime_caches(now_ts)
+    db_stats = await cleanup_db_retention(now_ts)
+    changed_runtime = sum(int(value or 0) for value in runtime_stats.values())
+    changed_db = sum(int(value or 0) for value in db_stats.values())
+    if changed_runtime > 0 or changed_db > 0:
+        log.info(
+            "Runtime maintenance done. runtime=%s db=%s",
+            runtime_stats,
+            db_stats,
+        )
 
 def format_autoban_notice(until_ts: int) -> str:
     remaining_sec = max(0, int(until_ts) - current_timestamp())
@@ -2212,8 +2572,14 @@ async def init_db():
         await db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_peer_conversation_id ON messages (peer_id, conversation_message_id)"
         )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_peer_user_conv_id ON messages (peer_id, user_id, conversation_message_id)"
+        )
         await db.execute("CREATE TABLE IF NOT EXISTS bot_dialogs (id INTEGER PRIMARY KEY AUTOINCREMENT, peer_id INTEGER, user_id INTEGER, role TEXT, text TEXT, timestamp INTEGER)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_bot_dialogs_peer_user_time ON bot_dialogs (peer_id, user_id, timestamp)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bot_dialogs_peer_user_role_time ON bot_dialogs (peer_id, user_id, role, timestamp)"
+        )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS chat_summary ("
             "peer_id INTEGER PRIMARY KEY, "
@@ -2469,16 +2835,141 @@ async def fetch_llm_messages(
             payload["reasoning_effort"] = reasoning_effort
         if venice_response_format is not None:
             payload["response_format"] = venice_response_format
-        response = await venice_request("POST", "chat/completions", json=payload)
-        response_data = response.json()
-        message = (response_data.get("choices") or [{}])[0].get("message", {}) or {}
-        content = message.get("content")
-        if not content:
-            # Some reasoning-capable models may return content separately.
-            content = message.get("reasoning_content")
-        if not content:
-            raise ValueError("Empty content in Venice response")
-        return content
+
+        def extract_text(value) -> str | None:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                stripped = value.strip()
+                return stripped if stripped else None
+            if isinstance(value, list):
+                parts: list[str] = []
+                for item in value:
+                    if item is None:
+                        continue
+                    if isinstance(item, str):
+                        if item:
+                            parts.append(item)
+                        continue
+                    if isinstance(item, dict):
+                        text_part = item.get("text")
+                        if isinstance(text_part, str) and text_part:
+                            parts.append(text_part)
+                            continue
+                        # Some providers nest text values.
+                        if isinstance(text_part, dict):
+                            nested = text_part.get("value") or text_part.get("content")
+                            if isinstance(nested, str) and nested:
+                                parts.append(nested)
+                                continue
+                        for key in ("content", "value"):
+                            nested = item.get(key)
+                            if isinstance(nested, str) and nested:
+                                parts.append(nested)
+                                break
+                combined = "".join(parts).strip()
+                return combined if combined else None
+            if isinstance(value, dict):
+                for key in ("text", "content", "value"):
+                    nested = value.get(key)
+                    if isinstance(nested, str) and nested.strip():
+                        return nested.strip()
+                return None
+            return None
+
+        def extract_response_text(data: dict) -> tuple[str | None, str | None]:
+            if not isinstance(data, dict):
+                return None, None
+            choices = data.get("choices")
+            if isinstance(choices, list):
+                for choice in choices:
+                    if not isinstance(choice, dict):
+                        continue
+                    finish_reason = choice.get("finish_reason")
+                    message_obj = choice.get("message")
+                    if isinstance(message_obj, dict):
+                        text = extract_text(
+                            message_obj.get("content")
+                            or message_obj.get("final")
+                            or message_obj.get("answer")
+                            or message_obj.get("output_text")
+                            or message_obj.get("text")
+                        )
+                        if text:
+                            return text, str(finish_reason) if finish_reason else None
+                        # Some models may only return tool_calls with no text.
+                        refusal = extract_text(message_obj.get("refusal"))
+                        if refusal:
+                            return refusal, str(finish_reason) if finish_reason else None
+                    # Fallback: sometimes chat endpoints return "text" directly on the choice.
+                    text = extract_text(choice.get("text") or choice.get("output_text"))
+                    if text:
+                        return text, str(finish_reason) if finish_reason else None
+                    # Keep finish_reason from the first choice for diagnostics.
+                    if finish_reason:
+                        return None, str(finish_reason)
+            # Last resort: top-level fields.
+            text = extract_text(data.get("output_text") or data.get("text"))
+            return (text, None) if text else (None, None)
+
+        async def request_and_extract(payload_obj: dict) -> tuple[str | None, str | None, dict]:
+            response = await venice_request("POST", "chat/completions", json=payload_obj)
+            response_data = response.json()
+            text, finish_reason = extract_response_text(response_data)
+            return text, finish_reason, response_data
+
+        content, finish_reason, response_data = await request_and_extract(payload)
+        if content:
+            return content
+
+        # Some reasoning models occasionally return an empty visible answer (often due to thinking/formatting).
+        # Retry once with disable_thinking enabled and without reasoning knobs.
+        fallback_payload = dict(payload)
+        fallback_params = dict(venice_parameters)
+        fallback_params.pop("strip_thinking_response", None)
+        fallback_params["disable_thinking"] = True
+        fallback_payload["venice_parameters"] = fallback_params
+        fallback_payload.pop("reasoning", None)
+        fallback_payload.pop("reasoning_effort", None)
+
+        fallback_content, fallback_finish_reason, _ = await request_and_extract(fallback_payload)
+        if fallback_content:
+            return fallback_content
+
+        # Provide a useful error for troubleshooting/config tweaks.
+        try:
+            if isinstance(response_data, dict):
+                safe_choices: list[dict] = []
+                for choice in response_data.get("choices") or []:
+                    if not isinstance(choice, dict):
+                        continue
+                    msg = choice.get("message")
+                    msg_keys = sorted(list(msg.keys())) if isinstance(msg, dict) else []
+                    safe_choices.append(
+                        {
+                            "finish_reason": choice.get("finish_reason"),
+                            "message_keys": msg_keys,
+                            "has_content": bool(isinstance(msg, dict) and msg.get("content")),
+                            "has_text": bool(choice.get("text") or choice.get("output_text")),
+                        }
+                    )
+                log.debug(
+                    "Venice empty content diagnostic target=%s model=%s choices=%s keys=%s",
+                    target,
+                    str((response_data.get("model") or "")).strip(),
+                    len(safe_choices),
+                    safe_choices[:3],
+                )
+        except Exception:
+            pass
+        choices_len = 0
+        if isinstance(response_data, dict) and isinstance(response_data.get("choices"), list):
+            choices_len = len(response_data.get("choices"))
+        reason = fallback_finish_reason or finish_reason
+        hint = ""
+        if str(reason or "").lower() in ("length", "max_tokens"):
+            hint = " (possibly hit token limit; increase /токены)"
+        raise ValueError(f"Empty content in Venice response (choices={choices_len} finish_reason={reason}){hint}")
 
     if provider != "groq":
         raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -2861,6 +3352,7 @@ async def scheduler_loop():
     log.info("Scheduler started")
     while True:
         try:
+            await run_runtime_maintenance()
             now = datetime.datetime.now(MSK_TZ)
             now_time = now.strftime("%H:%M")
             month_key = now.strftime("%Y-%m")
@@ -3398,6 +3890,9 @@ async def memory_handler(message: Message):
         key = (int(message.peer_id), int(target_user_id))
         USER_MEMORY_PENDING_BY_KEY.pop(key, None)
         USER_MEMORY_LAST_TRIGGER_TS_BY_KEY.pop(key, None)
+        lock = USER_MEMORY_LOCKS_BY_KEY.get(key)
+        if lock is None or not lock.locked():
+            USER_MEMORY_LOCKS_BY_KEY.pop(key, None)
         await send_reply(
             message,
             f"✅ Память про [id{target_user_id}|{target_name}] сброшена. (удалено {deleted})",
@@ -4149,6 +4644,7 @@ async def maybe_proactive_chatbot(message: Message):
                 except Exception:
                     author_name = f"id{message.from_id}"
                 USER_NAME_CACHE[message.from_id] = author_name
+            USER_NAME_CACHE_LAST_SEEN_TS[int(message.from_id)] = int(now_ts)
 
             current_line = f"{author_name} ({message.from_id}): {trim_text_middle(text, CHAT_CONTEXT_LINE_MAX_CHARS)}"
             llm_messages = [{"role": "system", "content": CHATBOT_PROACTIVE_SYSTEM_PROMPT}]
@@ -4338,7 +4834,7 @@ async def mention_reply_handler(message: Message):
             await send_reply(message, "⚠️ Не удалось проверить запрос на безопасность. Попробуй позже.")
             return
         response_text_raw = await fetch_llm_messages(chat_messages, max_tokens=CHAT_MAX_TOKENS, target="chat")
-        response_text_raw = str(response_text_raw or "").strip()
+        response_text_raw = strip_reasoning_leak(str(response_text_raw or "").strip())
         if not response_text_raw:
             await send_reply(message, "❌ Ответ получился пустым. Попробуй позже.")
             return
@@ -4423,6 +4919,36 @@ async def mention_reply_handler(message: Message):
     except httpx.RequestError as e:
         log.exception("Mention reply network error peer_id=%s user_id=%s: %s", message.peer_id, message.from_id, e)
         await send_reply(message, "🌐 Ошибка сети при запросе к модели. Попробуй позже.")
+    except ValueError as e:
+        error_text = str(e or "").strip()
+        if "empty content in venice response" in error_text.casefold():
+            log.warning(
+                "Mention reply got empty Venice content peer_id=%s user_id=%s: %s",
+                message.peer_id,
+                message.from_id,
+                error_text,
+            )
+            await send_reply(
+                message,
+                "⚠️ Venice-модель вернула пустой ответ. Попробуй увеличить `/токены chat 600` или смени модель.",
+            )
+            return
+        if "empty content in groq response" in error_text.casefold():
+            log.warning(
+                "Mention reply got empty Groq content peer_id=%s user_id=%s: %s",
+                message.peer_id,
+                message.from_id,
+                error_text,
+            )
+            await send_reply(message, "⚠️ Модель вернула пустой ответ. Попробуй позже.")
+            return
+        log.exception(
+            "Mention reply value error peer_id=%s user_id=%s: %s",
+            message.peer_id,
+            message.from_id,
+            error_text,
+        )
+        await send_reply(message, "❌ Ошибка ответа. Попробуй позже.")
     except RuntimeError as e:
         error_text = str(e or "").strip()
         match = re.match(r"^HTTP\\s+(\\d{3})\\b", error_text)
@@ -4465,6 +4991,7 @@ async def logger(message: Message):
 async def start_background_tasks():
     await init_db()
     await load_bot_settings()
+    await run_runtime_maintenance(force=True)
     log.info(
         "Loaded settings from DB. game_provider=%s chat_provider=%s chatbot_enabled=%s",
         LLM_PROVIDER,
