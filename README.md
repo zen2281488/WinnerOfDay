@@ -54,6 +54,12 @@ VENICE_MODEL=venice-uncensored
 VENICE_BASE_URL=https://api.venice.ai/api/v1/
 VENICE_TEMPERATURE=0.9
 VENICE_TIMEOUT=30
+VENICE_STRIP_THINKING_RESPONSE=false
+VENICE_DISABLE_THINKING=false
+# reasoning effort: low|medium|high (optional)
+VENICE_REASONING_EFFORT=
+# Override for chat only (optional)
+CHAT_VENICE_REASONING_EFFORT=
 ```
 
 ### Чатбот
