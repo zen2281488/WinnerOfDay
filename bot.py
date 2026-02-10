@@ -235,8 +235,18 @@ if VENICE_TIMEOUT is None:
     VENICE_TIMEOUT = 30.0
 
 VENICE_INCLUDE_SYSTEM_PROMPT = read_bool_env("VENICE_INCLUDE_SYSTEM_PROMPT", default=False)
-VENICE_STRIP_THINKING_RESPONSE = read_bool_env("VENICE_STRIP_THINKING_RESPONSE", default=False)
+# Reasoning-capable models may output "analysis/thinking" text into the visible response.
+# For a VK chatbot this is almost always unwanted, so we default to stripping it.
+VENICE_STRIP_THINKING_RESPONSE = read_bool_env("VENICE_STRIP_THINKING_RESPONSE", default=True)
+CHAT_VENICE_STRIP_THINKING_RESPONSE = read_bool_env(
+    "CHAT_VENICE_STRIP_THINKING_RESPONSE",
+    default=VENICE_STRIP_THINKING_RESPONSE,
+)
 VENICE_DISABLE_THINKING = read_bool_env("VENICE_DISABLE_THINKING", default=False)
+CHAT_VENICE_DISABLE_THINKING = read_bool_env(
+    "CHAT_VENICE_DISABLE_THINKING",
+    default=VENICE_DISABLE_THINKING,
+)
 
 def _parse_reasoning_effort(value: str | None) -> str | None:
     if value is None:
@@ -357,6 +367,7 @@ CMD_SET_PROVIDER = "/провайдер"
 CMD_LIST_MODELS = "/список_моделей"
 CMD_PROMPT = "/промт"
 CMD_CHAT_LIMIT = "/лимит"
+CMD_TOKENS = "/токены"
 CMD_LEADERBOARD = "/лидерборд"
 CMD_LEADERBOARD_TIMER_SET = "/таймер_лидерборда"
 CMD_LEADERBOARD_TIMER_RESET = "/сброс_таймера_лидерборда"
@@ -504,6 +515,14 @@ CHAT_SYSTEM_PROMPT = normalize_prompt(
         "Ты чат-бот сообщества VK. Отвечай по-русски, по делу и без JSON."
     )
 )
+CHAT_FINAL_ONLY_PROMPT = normalize_prompt(os.getenv("CHAT_FINAL_ONLY_PROMPT", "") or "")
+if not CHAT_FINAL_ONLY_PROMPT:
+    CHAT_FINAL_ONLY_PROMPT = (
+        "Не раскрывай внутренние рассуждения (chain-of-thought): "
+        "не пиши анализ, план, стратегию, проверки ограничений и т.п. "
+        "Не выводи разделы вроде 'Analyze/Strategy/Internal Monologue'. "
+        "Покажи только финальный ответ."
+    )
 
 # Venice умеет принудительно валидировать формат ответа через response_format=json_schema.
 # Это сильно повышает стабильность JSON-ответов и уменьшает "обрезания"/мусор вокруг JSON.
@@ -1962,6 +1981,8 @@ def build_bot_settings_defaults() -> dict[str, str]:
         "CHATBOT_PROACTIVE_ENABLED": "1" if CHATBOT_PROACTIVE_ENABLED else "0",
         "CHAT_SUMMARY_ENABLED": "1" if CHAT_SUMMARY_ENABLED else "0",
         "CHAT_USER_MEMORY_ENABLED": "1" if CHAT_USER_MEMORY_ENABLED else "0",
+        "LLM_MAX_TOKENS": setting_to_text(LLM_MAX_TOKENS),
+        "CHAT_MAX_TOKENS": setting_to_text(CHAT_MAX_TOKENS),
         "CHAT_RESPONSE_MAX_CHARS": setting_to_text(CHAT_RESPONSE_MAX_CHARS),
         "USER_PROMPT_TEMPLATE": setting_to_text(USER_PROMPT_TEMPLATE),
     }
@@ -1992,6 +2013,8 @@ def apply_bot_settings(settings: dict[str, str]):
     global CHATBOT_PROACTIVE_ENABLED
     global CHAT_SUMMARY_ENABLED
     global CHAT_USER_MEMORY_ENABLED
+    global LLM_MAX_TOKENS
+    global CHAT_MAX_TOKENS
     global CHAT_RESPONSE_MAX_CHARS
     global USER_PROMPT_TEMPLATE
     global groq_client
@@ -2041,6 +2064,16 @@ def apply_bot_settings(settings: dict[str, str]):
         settings.get("CHAT_USER_MEMORY_ENABLED"),
         CHAT_USER_MEMORY_ENABLED,
     )
+    LLM_MAX_TOKENS = parse_setting_int(
+        settings.get("LLM_MAX_TOKENS"),
+        LLM_MAX_TOKENS,
+        min_value=1,
+    )
+    CHAT_MAX_TOKENS = parse_setting_int(
+        settings.get("CHAT_MAX_TOKENS"),
+        CHAT_MAX_TOKENS,
+        min_value=1,
+    )
     CHAT_RESPONSE_MAX_CHARS = parse_setting_int(
         settings.get("CHAT_RESPONSE_MAX_CHARS"),
         CHAT_RESPONSE_MAX_CHARS,
@@ -2065,6 +2098,8 @@ def apply_bot_settings(settings: dict[str, str]):
     os.environ["CHATBOT_PROACTIVE_ENABLED"] = "1" if CHATBOT_PROACTIVE_ENABLED else "0"
     os.environ["CHAT_SUMMARY_ENABLED"] = "1" if CHAT_SUMMARY_ENABLED else "0"
     os.environ["CHAT_USER_MEMORY_ENABLED"] = "1" if CHAT_USER_MEMORY_ENABLED else "0"
+    os.environ["LLM_MAX_TOKENS"] = str(LLM_MAX_TOKENS)
+    os.environ["CHAT_MAX_TOKENS"] = str(CHAT_MAX_TOKENS)
     os.environ["CHAT_RESPONSE_MAX_CHARS"] = str(CHAT_RESPONSE_MAX_CHARS)
     os.environ["USER_PROMPT_TEMPLATE"] = USER_PROMPT_TEMPLATE
     if GROQ_API_KEY:
@@ -2359,12 +2394,22 @@ async def fetch_llm_messages(
             venice_model,
             venice_temperature,
         )
+        strip_thinking_response = (
+            CHAT_VENICE_STRIP_THINKING_RESPONSE
+            if target == "chat"
+            else VENICE_STRIP_THINKING_RESPONSE
+        )
+        disable_thinking = (
+            CHAT_VENICE_DISABLE_THINKING
+            if target == "chat"
+            else VENICE_DISABLE_THINKING
+        )
         venice_parameters: dict = {
             "include_venice_system_prompt": VENICE_INCLUDE_SYSTEM_PROMPT,
         }
-        if VENICE_STRIP_THINKING_RESPONSE:
+        if strip_thinking_response:
             venice_parameters["strip_thinking_response"] = True
-        if VENICE_DISABLE_THINKING:
+        if disable_thinking:
             venice_parameters["disable_thinking"] = True
         payload = {
             "model": venice_model,
@@ -2900,8 +2945,10 @@ async def show_settings(message: Message):
         f"• groq: `{CHAT_GROQ_MODEL}` (t `{CHAT_GROQ_TEMPERATURE}`){chat_groq_marker}\n"
         f"• venice: `{CHAT_VENICE_MODEL}` (t `{CHAT_VENICE_TEMPERATURE}`){chat_venice_marker}\n\n"
         f"🔑 **Ключи:** groq `{groq_key_short}`, venice `{venice_key_short}`\n\n"
-        f"🧠 **Venice reasoning:** strip `{int(bool(VENICE_STRIP_THINKING_RESPONSE))}`, "
-        f"disable `{int(bool(VENICE_DISABLE_THINKING))}`, "
+        f"🧠 **Venice reasoning:** strip chat `{int(bool(CHAT_VENICE_STRIP_THINKING_RESPONSE))}`, "
+        f"game `{int(bool(VENICE_STRIP_THINKING_RESPONSE))}`, "
+        f"disable chat `{int(bool(CHAT_VENICE_DISABLE_THINKING))}`, "
+        f"game `{int(bool(VENICE_DISABLE_THINKING))}`, "
         f"effort chat `{CHAT_VENICE_REASONING_EFFORT or '—'}`, "
         f"game `{VENICE_REASONING_EFFORT or '—'}`\n\n"
         f"🛡 **Groq Guard (чат):** `{guard_status}`, блок: `{guard_categories}`\n\n"
@@ -2915,6 +2962,7 @@ async def show_settings(message: Message):
         f"🧠 **Контекст чата:** `{chat_context_status}` (посл. `{CHAT_CONTEXT_LIMIT}`)\n"
         f"📝 **Сводка чата:** `{chat_summary_status}` (каждые `{CHAT_SUMMARY_EVERY_MESSAGES}`, cd `{CHAT_SUMMARY_COOLDOWN_SECONDS}`s)\n"
         f"🧩 **Память (люди):** `{user_memory_status}` (каждые `{CHAT_USER_MEMORY_EVERY_MESSAGES}`, cd `{CHAT_USER_MEMORY_COOLDOWN_SECONDS}`s)\n"
+        f"🔢 **Токены (max_completion_tokens):** chat `{CHAT_MAX_TOKENS}`, game `{LLM_MAX_TOKENS}`\n"
         f"📏 **Лимит ответа (чат):** `{CHAT_RESPONSE_MAX_CHARS}` символов\n"
         f"Последнее обновление: {format_build_date(BUILD_DATE)}\n"
         f"{schedule_line}\n"
@@ -2932,6 +2980,7 @@ async def show_settings(message: Message):
         f"• `{CMD_CHATBOT} sum on|off` - Включить/выключить сводку чата\n"
         f"• `{CMD_CHATBOT} mem on|off` - Включить/выключить память по участникам\n"
         f"• `{CMD_MEMORY}` или `{CMD_MEMORY} сброс` - Показать/сбросить твою память\n"
+        f"• `{CMD_TOKENS} [chat|game] <число>` - Лимит токенов ответа модели\n"
         f"• `{CMD_CHAT_LIMIT} <число>` - Лимит символов в ответе чатбота (0 = без лимита; ответ будет разбит на части)\n"
         f"• `{CMD_RESET_CHAT}` - Сбросить историю чатбота с тобой\n"
         f"• `{CMD_BAN} Имя Фамилия` - Забанить пользователя (чатбот)\n"
@@ -3365,6 +3414,73 @@ async def chat_limit_handler(message: Message):
     if value == 0:
         note = f"\nℹ️ При 0 лимит по символам не применяется. Ответ будет разбит на части (до {CHAT_RESPONSE_MAX_PARTS} сообщений)."
     await send_reply(message, f"✅ Лимит ответа чатбота теперь: `{CHAT_RESPONSE_MAX_CHARS}` символов.{note}")
+
+@bot.on.message(StartswithRule(CMD_TOKENS))
+async def tokens_handler(message: Message):
+    if not await ensure_command_allowed(message, CMD_TOKENS):
+        return
+    # Это глобальная настройка, поэтому ограничим админами.
+    if not await ensure_admin_only(message, CMD_TOKENS):
+        return
+    global CHAT_MAX_TOKENS, LLM_MAX_TOKENS
+    args = strip_command(message.text, CMD_TOKENS)
+    normalized = normalize_spaces(args)
+    if not normalized:
+        await send_reply(
+            message,
+            "🔢 Лимит токенов ответа модели (max_completion_tokens).\n"
+            f"• chat: `{CHAT_MAX_TOKENS}`\n"
+            f"• game: `{LLM_MAX_TOKENS}`\n\n"
+            "Примеры:\n"
+            f"• `{CMD_TOKENS} 600` (по умолчанию chat)\n"
+            f"• `{CMD_TOKENS} chat 600`\n"
+            f"• `{CMD_TOKENS} game 1200`",
+        )
+        return
+
+    parts = normalized.split()
+    scope = None
+    value_str = None
+    if len(parts) >= 2:
+        parsed_scope = parse_llm_scope(parts[0])
+        if parsed_scope:
+            scope = parsed_scope
+            value_str = parts[1]
+            if len(parts) > 2:
+                await send_reply(message, "❌ Слишком много аргументов. Пример: `/токены chat 600`")
+                return
+
+    if scope is None:
+        scope = "chat"
+        value_str = parts[0]
+        if len(parts) > 1:
+            await send_reply(message, "❌ Неверный формат. Пример: `/токены chat 600` или `/токены 600`")
+            return
+
+    try:
+        value = int(value_str or "")
+    except ValueError:
+        await send_reply(message, "❌ Укажи число. Пример: `/токены chat 600`")
+        return
+    if value < 1:
+        await send_reply(message, "❌ Лимит токенов должен быть >= 1.")
+        return
+
+    if scope == "chat":
+        CHAT_MAX_TOKENS = value
+        os.environ["CHAT_MAX_TOKENS"] = str(value)
+        await set_bot_setting("CHAT_MAX_TOKENS", str(value))
+        await send_reply(
+            message,
+            f"✅ Лимит токенов (chat) теперь: `{CHAT_MAX_TOKENS}`.\n"
+            "ℹ️ `/лимит` влияет на символы в ответе, а `/токены` — на max_completion_tokens (из-за него ответы могут обрываться).",
+        )
+        return
+
+    LLM_MAX_TOKENS = value
+    os.environ["LLM_MAX_TOKENS"] = str(value)
+    await set_bot_setting("LLM_MAX_TOKENS", str(value))
+    await send_reply(message, f"✅ Лимит токенов (game) теперь: `{LLM_MAX_TOKENS}`.")
 
 @bot.on.message(StartswithRule(CMD_LIST_MODELS))
 async def list_models_handler(message: Message):
@@ -4122,7 +4238,10 @@ async def mention_reply_handler(message: Message):
             history_bot,
         )
 
-        chat_messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+        chat_messages = [
+            {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+            {"role": "system", "content": CHAT_FINAL_ONLY_PROMPT},
+        ]
         if message.peer_id != message.from_id:
             summary_prompt = await build_chat_summary_prompt(message.peer_id)
             if summary_prompt:

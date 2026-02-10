@@ -44,6 +44,7 @@ USER_PROMPT_TEMPLATE=Лог чата:\n{{CHAT_LOG}}\n\nКто из них поб
 ### LLM провайдеры
 ```
 LLM_PROVIDER=groq|venice
+LLM_MAX_TOKENS=800
 
 GROQ_API_KEY=gsk_***
 GROQ_MODEL=llama-3.3-70b-versatile
@@ -54,8 +55,11 @@ VENICE_MODEL=venice-uncensored
 VENICE_BASE_URL=https://api.venice.ai/api/v1/
 VENICE_TEMPERATURE=0.9
 VENICE_TIMEOUT=30
-VENICE_STRIP_THINKING_RESPONSE=false
+VENICE_STRIP_THINKING_RESPONSE=true
 VENICE_DISABLE_THINKING=false
+# Override for chat only (optional)
+CHAT_VENICE_STRIP_THINKING_RESPONSE=
+CHAT_VENICE_DISABLE_THINKING=
 # reasoning effort: low|medium|high (optional)
 VENICE_REASONING_EFFORT=
 # Override for chat only (optional)
@@ -66,6 +70,7 @@ CHAT_VENICE_REASONING_EFFORT=
 ```
 CHATBOT_ENABLED=true
 CHAT_SYSTEM_PROMPT=Отвечай кратко и по-русски.
+CHAT_FINAL_ONLY_PROMPT=
 CHAT_MAX_TOKENS=300
 CHAT_RESPONSE_MAX_CHARS=600
 CHAT_MESSAGE_MAX_CHARS=300
