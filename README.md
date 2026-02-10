@@ -54,12 +54,15 @@ VENICE_API_KEY=vnk_***
 VENICE_MODEL=venice-uncensored
 VENICE_BASE_URL=https://api.venice.ai/api/v1/
 VENICE_TEMPERATURE=0.9
-VENICE_TIMEOUT=30
+VENICE_TIMEOUT=90
 VENICE_STRIP_THINKING_RESPONSE=true
 VENICE_DISABLE_THINKING=false
 # Override for chat only (optional)
 CHAT_VENICE_STRIP_THINKING_RESPONSE=
 CHAT_VENICE_DISABLE_THINKING=
+# Retry on transient network/5xx/429 (optional)
+VENICE_RETRY_ATTEMPTS=2
+VENICE_RETRY_BACKOFF_SECONDS=1.0
 # reasoning effort: low|medium|high (optional)
 VENICE_REASONING_EFFORT=
 # Override for chat only (optional)

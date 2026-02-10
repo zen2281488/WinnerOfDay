@@ -230,9 +230,16 @@ VENICE_TEMPERATURE = read_float_env("VENICE_TEMPERATURE", default=0.9)
 if VENICE_TEMPERATURE is None:
     VENICE_TEMPERATURE = 0.9
 
-VENICE_TIMEOUT = read_float_env("VENICE_TIMEOUT", default=30.0)
+VENICE_TIMEOUT = read_float_env("VENICE_TIMEOUT", default=90.0)
 if VENICE_TIMEOUT is None:
-    VENICE_TIMEOUT = 30.0
+    VENICE_TIMEOUT = 90.0
+
+VENICE_RETRY_ATTEMPTS = read_int_env("VENICE_RETRY_ATTEMPTS", default=2, min_value=0)
+if VENICE_RETRY_ATTEMPTS is None:
+    VENICE_RETRY_ATTEMPTS = 2
+VENICE_RETRY_BACKOFF_SECONDS = read_float_env("VENICE_RETRY_BACKOFF_SECONDS", default=1.0)
+if VENICE_RETRY_BACKOFF_SECONDS is None:
+    VENICE_RETRY_BACKOFF_SECONDS = 1.0
 
 VENICE_INCLUDE_SYSTEM_PROMPT = read_bool_env("VENICE_INCLUDE_SYSTEM_PROMPT", default=False)
 # Reasoning-capable models may output "analysis/thinking" text into the visible response.
@@ -2151,15 +2158,47 @@ def build_venice_headers() -> dict:
 async def venice_request(method: str, path: str, **kwargs) -> httpx.Response:
     headers = kwargs.pop("headers", {})
     request_headers = {**build_venice_headers(), **headers}
-    timeout = httpx.Timeout(VENICE_TIMEOUT)
-    async with httpx.AsyncClient(base_url=VENICE_BASE_URL, timeout=timeout) as client:
-        response = await client.request(method, path, headers=request_headers, **kwargs)
-    if response.status_code >= 400:
-        message = response.text.strip()
-        if len(message) > 500:
-            message = message[:500] + "..."
-        raise RuntimeError(f"HTTP {response.status_code}: {message}")
-    return response
+
+    # Reasoning models may take noticeably longer; also Venice endpoints sometimes return transient 5xx/429.
+    timeout = kwargs.pop(
+        "timeout",
+        httpx.Timeout(VENICE_TIMEOUT, connect=min(10.0, float(VENICE_TIMEOUT or 90.0))),
+    )
+    attempts = max(1, int(VENICE_RETRY_ATTEMPTS or 0) + 1)
+    backoff = float(VENICE_RETRY_BACKOFF_SECONDS or 0.0)
+
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            async with httpx.AsyncClient(base_url=VENICE_BASE_URL, timeout=timeout) as client:
+                response = await client.request(method, path, headers=request_headers, **kwargs)
+
+            # Retry for common transient statuses.
+            if response.status_code in (408, 429, 500, 502, 503, 504) and attempt + 1 < attempts:
+                delay = backoff * (2**attempt) if backoff > 0 else 0
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                continue
+
+            if response.status_code >= 400:
+                message = response.text.strip()
+                if len(message) > 500:
+                    message = message[:500] + "..."
+                raise RuntimeError(f"HTTP {response.status_code}: {message}")
+
+            return response
+        except httpx.RequestError as e:
+            last_exc = e
+            if attempt + 1 >= attempts:
+                raise
+            delay = backoff * (2**attempt) if backoff > 0 else 0
+            if delay > 0:
+                await asyncio.sleep(delay)
+            continue
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Venice request failed")
 
 # ================= БАЗА ДАННЫХ =================
 async def init_db():
@@ -4375,6 +4414,25 @@ async def mention_reply_handler(message: Message):
                     (message.peer_id, message.from_id, "assistant", response_for_store, now_ts),
                 )
             await db.commit()
+    except httpx.TimeoutException as e:
+        log.exception("Mention reply timeout peer_id=%s user_id=%s: %s", message.peer_id, message.from_id, e)
+        await send_reply(
+            message,
+            "⏳ Таймаут запроса к модели (часто бывает на reasoning-моделях). Попробуй еще раз чуть позже.",
+        )
+    except httpx.RequestError as e:
+        log.exception("Mention reply network error peer_id=%s user_id=%s: %s", message.peer_id, message.from_id, e)
+        await send_reply(message, "🌐 Ошибка сети при запросе к модели. Попробуй позже.")
+    except RuntimeError as e:
+        error_text = str(e or "").strip()
+        match = re.match(r"^HTTP\\s+(\\d{3})\\b", error_text)
+        if match:
+            code = match.group(1)
+            log.exception("Mention reply Venice HTTP error peer_id=%s user_id=%s: %s", message.peer_id, message.from_id, e)
+            await send_reply(message, f"⚠️ Ошибка Venice API (HTTP {code}). Попробуй позже.")
+            return
+        log.exception("Mention reply runtime error peer_id=%s user_id=%s: %s", message.peer_id, message.from_id, e)
+        await send_reply(message, "❌ Ошибка ответа. Попробуй позже.")
     except Exception as e:
         log.exception("Mention reply failed: %s", e)
         await send_reply(message, "❌ Ошибка ответа. Попробуй позже.")
