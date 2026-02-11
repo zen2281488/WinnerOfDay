@@ -119,12 +119,12 @@ if not CHAT_CONTEXT_GUARD_PROMPT:
     )
 
 # === Proactive режим (бот иногда сам пишет в конфу) ===
-CHATBOT_PROACTIVE_ENABLED = read_bool_env("CHATBOT_PROACTIVE_ENABLED", default=False)
-CHATBOT_PROACTIVE_PROBABILITY = read_float_env("CHATBOT_PROACTIVE_PROBABILITY", default=0.03)
+CHATBOT_PROACTIVE_ENABLED = read_bool_env("CHATBOT_PROACTIVE_ENABLED", default=True)
+CHATBOT_PROACTIVE_PROBABILITY = read_float_env("CHATBOT_PROACTIVE_PROBABILITY", default=0.06)
 if CHATBOT_PROACTIVE_PROBABILITY is None:
-    CHATBOT_PROACTIVE_PROBABILITY = 0.03
-CHATBOT_PROACTIVE_COOLDOWN_SECONDS = read_int_env("CHATBOT_PROACTIVE_COOLDOWN_SECONDS", default=180, min_value=0) or 180
-CHATBOT_PROACTIVE_MIN_MESSAGES_SINCE_BOT = read_int_env("CHATBOT_PROACTIVE_MIN_MESSAGES_SINCE_BOT", default=20, min_value=0) or 20
+    CHATBOT_PROACTIVE_PROBABILITY = 0.06
+CHATBOT_PROACTIVE_COOLDOWN_SECONDS = read_int_env("CHATBOT_PROACTIVE_COOLDOWN_SECONDS", default=120, min_value=0) or 120
+CHATBOT_PROACTIVE_MIN_MESSAGES_SINCE_BOT = read_int_env("CHATBOT_PROACTIVE_MIN_MESSAGES_SINCE_BOT", default=8, min_value=0) or 8
 CHATBOT_PROACTIVE_CONTEXT_LIMIT = read_int_env("CHATBOT_PROACTIVE_CONTEXT_LIMIT", default=18, min_value=0) or 18
 CHATBOT_PROACTIVE_MAX_CHARS = read_int_env("CHATBOT_PROACTIVE_MAX_CHARS", default=260, min_value=0) or 260
 CHATBOT_PROACTIVE_MAX_TOKENS = read_int_env("CHATBOT_PROACTIVE_MAX_TOKENS", default=200, min_value=1) or 200
@@ -155,6 +155,42 @@ if not CHATBOT_PROACTIVE_REACTION_IDS:
 CHATBOT_PROACTIVE_REACTION_IDS = [rid for rid in CHATBOT_PROACTIVE_REACTION_IDS if 1 <= int(rid) <= 16]
 if not CHATBOT_PROACTIVE_REACTION_IDS:
     CHATBOT_PROACTIVE_REACTION_IDS = list(range(1, 17))
+CHATBOT_PROACTIVE_REACTION_USE_LLM = read_bool_env("CHATBOT_PROACTIVE_REACTION_USE_LLM", default=True)
+CHATBOT_PROACTIVE_REACTION_LLM_PROVIDER = (
+    os.getenv("CHATBOT_PROACTIVE_REACTION_LLM_PROVIDER", "") or ""
+).strip().lower()
+CHATBOT_PROACTIVE_REACTION_GROQ_MODEL = (
+    os.getenv("CHATBOT_PROACTIVE_REACTION_GROQ_MODEL", "llama-3.1-8b-instant") or ""
+).strip() or "llama-3.1-8b-instant"
+CHATBOT_PROACTIVE_REACTION_GROQ_TEMPERATURE = read_float_env(
+    "CHATBOT_PROACTIVE_REACTION_GROQ_TEMPERATURE",
+    default=0.15,
+)
+if CHATBOT_PROACTIVE_REACTION_GROQ_TEMPERATURE is None:
+    CHATBOT_PROACTIVE_REACTION_GROQ_TEMPERATURE = 0.15
+CHATBOT_PROACTIVE_REACTION_VENICE_MODEL = (
+    os.getenv("CHATBOT_PROACTIVE_REACTION_VENICE_MODEL", "") or ""
+).strip()
+CHATBOT_PROACTIVE_REACTION_VENICE_TEMPERATURE = read_float_env(
+    "CHATBOT_PROACTIVE_REACTION_VENICE_TEMPERATURE",
+    default=0.15,
+)
+if CHATBOT_PROACTIVE_REACTION_VENICE_TEMPERATURE is None:
+    CHATBOT_PROACTIVE_REACTION_VENICE_TEMPERATURE = 0.15
+CHATBOT_PROACTIVE_REACTION_MAX_TOKENS = (
+    read_int_env("CHATBOT_PROACTIVE_REACTION_MAX_TOKENS", default=90, min_value=20) or 90
+)
+CHATBOT_PROACTIVE_REACTION_SYSTEM_PROMPT = normalize_prompt(
+    os.getenv("CHATBOT_PROACTIVE_REACTION_SYSTEM_PROMPT", "") or ""
+)
+if not CHATBOT_PROACTIVE_REACTION_SYSTEM_PROMPT:
+    CHATBOT_PROACTIVE_REACTION_SYSTEM_PROMPT = (
+        "Ты выбираешь реакцию на сообщение в групповом чате VK.\n"
+        "Реши: ставить реакцию или нет. Если сообщение нейтральное/техническое/неподходящее — react=false.\n"
+        "Не спамь реакциями.\n"
+        "Верни строго JSON: {\"react\": true|false, \"reaction_id\": число, \"reason\": \"кратко\"}.\n"
+        "Если react=false: reaction_id=0.\n"
+    )
 
 # === Сводка чата (mid-term память) ===
 CHAT_SUMMARY_ENABLED = read_bool_env("CHAT_SUMMARY_ENABLED", default=False)
@@ -169,6 +205,11 @@ CHAT_SUMMARY_TRANSCRIPT_MAX_CHARS = read_int_env("CHAT_SUMMARY_TRANSCRIPT_MAX_CH
 CHAT_SUMMARY_LINE_MAX_CHARS = read_int_env("CHAT_SUMMARY_LINE_MAX_CHARS", default=200, min_value=50) or 200
 CHAT_SUMMARY_SKIP_COMMANDS = read_bool_env("CHAT_SUMMARY_SKIP_COMMANDS", default=True)
 CHAT_SUMMARY_MAX_TOKENS = read_int_env("CHAT_SUMMARY_MAX_TOKENS", default=220, min_value=50) or 220
+CHAT_SUMMARY_POST_ENABLED = read_bool_env("CHAT_SUMMARY_POST_ENABLED", default=True)
+CHAT_SUMMARY_POST_MAX_CHARS = read_int_env("CHAT_SUMMARY_POST_MAX_CHARS", default=900, min_value=200) or 900
+CHAT_SUMMARY_POST_PREFIX = normalize_prompt(
+    os.getenv("CHAT_SUMMARY_POST_PREFIX", "📝 Сводка чата обновлена:\n")
+)
 
 CHAT_SUMMARY_SYSTEM_PROMPT = normalize_prompt(os.getenv("CHAT_SUMMARY_SYSTEM_PROMPT", "") or "")
 if not CHAT_SUMMARY_SYSTEM_PROMPT:
@@ -199,6 +240,12 @@ CHAT_USER_MEMORY_TRANSCRIPT_MAX_CHARS = read_int_env("CHAT_USER_MEMORY_TRANSCRIP
 CHAT_USER_MEMORY_LINE_MAX_CHARS = read_int_env("CHAT_USER_MEMORY_LINE_MAX_CHARS", default=180, min_value=50) or 180
 CHAT_USER_MEMORY_SKIP_COMMANDS = read_bool_env("CHAT_USER_MEMORY_SKIP_COMMANDS", default=True)
 CHAT_USER_MEMORY_MAX_TOKENS = read_int_env("CHAT_USER_MEMORY_MAX_TOKENS", default=180, min_value=50) or 180
+CHAT_USER_MEMORY_BOOTSTRAP_MIN_NEW_MESSAGES = (
+    read_int_env("CHAT_USER_MEMORY_BOOTSTRAP_MIN_NEW_MESSAGES", default=3, min_value=1) or 3
+)
+CHAT_USER_MEMORY_FORCE_COOLDOWN_SECONDS = (
+    read_int_env("CHAT_USER_MEMORY_FORCE_COOLDOWN_SECONDS", default=900, min_value=0) or 900
+)
 
 CHAT_USER_MEMORY_SYSTEM_PROMPT = normalize_prompt(os.getenv("CHAT_USER_MEMORY_SYSTEM_PROMPT", "") or "")
 if not CHAT_USER_MEMORY_SYSTEM_PROMPT:
@@ -265,9 +312,42 @@ def _parse_reasoning_effort(value: str | None) -> str | None:
         return cleaned
     return None
 
+def _parse_reasoning_mode(value: str | None, default: str = "fixed") -> str:
+    cleaned = str(value or "").strip().lower()
+    if cleaned in ("auto", "fixed"):
+        return cleaned
+    return default
+
 VENICE_REASONING_EFFORT = _parse_reasoning_effort(os.getenv("VENICE_REASONING_EFFORT"))
 CHAT_VENICE_REASONING_EFFORT = _parse_reasoning_effort(
     os.getenv("CHAT_VENICE_REASONING_EFFORT") or (VENICE_REASONING_EFFORT or "")
+)
+VENICE_REASONING_MODE = _parse_reasoning_mode(os.getenv("VENICE_REASONING_MODE"), default="fixed")
+CHAT_VENICE_REASONING_MODE = _parse_reasoning_mode(
+    os.getenv("CHAT_VENICE_REASONING_MODE") or VENICE_REASONING_MODE,
+    default=VENICE_REASONING_MODE,
+)
+VENICE_AUTO_LIGHT_DISABLE_THINKING = read_bool_env("VENICE_AUTO_LIGHT_DISABLE_THINKING", default=True)
+CHAT_VENICE_AUTO_LIGHT_DISABLE_THINKING = read_bool_env(
+    "CHAT_VENICE_AUTO_LIGHT_DISABLE_THINKING",
+    default=VENICE_AUTO_LIGHT_DISABLE_THINKING,
+)
+VENICE_AUTO_SHORT_CHARS = read_int_env("VENICE_AUTO_SHORT_CHARS", default=220, min_value=20) or 220
+VENICE_AUTO_LONG_CHARS = read_int_env("VENICE_AUTO_LONG_CHARS", default=800, min_value=80) or 800
+VENICE_AUTO_HEAVY_TRANSCRIPT_CHARS = (
+    read_int_env("VENICE_AUTO_HEAVY_TRANSCRIPT_CHARS", default=2200, min_value=200) or 2200
+)
+VENICE_AUTO_HEAVY_MESSAGES = read_int_env("VENICE_AUTO_HEAVY_MESSAGES", default=12, min_value=2) or 12
+
+VENICE_AUTO_COMPLEX_HINTS_RE = re.compile(
+    r"(?i)\b("
+    r"analy[sz]e|architecture|debug|optimi[sz]e|refactor|algorithm|proof|reason|compare|trade[- ]?off|"
+    r"sql|regex|python|javascript|typescript|code|bug|issue|traceback|benchmark|"
+    r"анализ|архитект|дебаг|оптимиз|рефактор|алгоритм|докажи|сравни|пошаг|объясни почему"
+    r")\b"
+)
+VENICE_AUTO_SIMPLE_HINTS_RE = re.compile(
+    r"(?is)^\s*(hi|hello|ok|thanks|thx|yes|no|привет|ок|спс|спасибо|да|нет|понял|ага)\s*[.!?]*\s*$"
 )
 
 if not LLM_PROVIDER:
@@ -289,6 +369,25 @@ CHAT_VENICE_MODEL = os.getenv("CHAT_VENICE_MODEL", VENICE_MODEL)
 CHAT_VENICE_TEMPERATURE = read_float_env("CHAT_VENICE_TEMPERATURE", default=VENICE_TEMPERATURE)
 if CHAT_VENICE_TEMPERATURE is None:
     CHAT_VENICE_TEMPERATURE = VENICE_TEMPERATURE
+
+OPS_LLM_PROVIDER = os.getenv("OPS_LLM_PROVIDER", "").strip().lower()
+if not OPS_LLM_PROVIDER:
+    OPS_LLM_PROVIDER = CHAT_LLM_PROVIDER
+
+OPS_GROQ_MODEL = (os.getenv("OPS_GROQ_MODEL", CHAT_GROQ_MODEL) or "").strip() or CHAT_GROQ_MODEL
+OPS_GROQ_TEMPERATURE = read_float_env("OPS_GROQ_TEMPERATURE", default=CHAT_GROQ_TEMPERATURE)
+if OPS_GROQ_TEMPERATURE is None:
+    OPS_GROQ_TEMPERATURE = CHAT_GROQ_TEMPERATURE
+
+OPS_VENICE_MODEL = (os.getenv("OPS_VENICE_MODEL", CHAT_VENICE_MODEL) or "").strip() or CHAT_VENICE_MODEL
+OPS_VENICE_TEMPERATURE = read_float_env("OPS_VENICE_TEMPERATURE", default=CHAT_VENICE_TEMPERATURE)
+if OPS_VENICE_TEMPERATURE is None:
+    OPS_VENICE_TEMPERATURE = CHAT_VENICE_TEMPERATURE
+
+if CHATBOT_PROACTIVE_REACTION_LLM_PROVIDER not in ("groq", "venice"):
+    CHATBOT_PROACTIVE_REACTION_LLM_PROVIDER = ""
+if not CHATBOT_PROACTIVE_REACTION_VENICE_MODEL:
+    CHATBOT_PROACTIVE_REACTION_VENICE_MODEL = CHAT_VENICE_MODEL
 
 CHAT_GROQ_GUARD_ENABLED = read_bool_env("CHAT_GROQ_GUARD_ENABLED", default=True)
 CHAT_GROQ_GUARD_MODEL = (
@@ -345,6 +444,10 @@ if CHAT_LLM_PROVIDER not in ("groq", "venice"):
     log.warning("CHAT_LLM_PROVIDER must be groq or venice (got %s)", CHAT_LLM_PROVIDER)
     CHAT_LLM_PROVIDER = LLM_PROVIDER
 
+if OPS_LLM_PROVIDER not in ("groq", "venice"):
+    log.warning("OPS_LLM_PROVIDER must be groq or venice (got %s)", OPS_LLM_PROVIDER)
+    OPS_LLM_PROVIDER = CHAT_LLM_PROVIDER
+
 if LLM_PROVIDER == "groq":
     if not GROQ_API_KEY:
         log.warning("GROQ_API_KEY is missing while LLM_PROVIDER=groq (game may fall back)")
@@ -363,6 +466,15 @@ if CHATBOT_ENABLED:
     else:
         if not VENICE_API_KEY:
             log.warning("VENICE_API_KEY is missing while CHAT_LLM_PROVIDER=venice (chatbot may not work)")
+
+    if OPS_LLM_PROVIDER == "groq":
+        if not GROQ_API_KEY:
+            log.warning("GROQ_API_KEY is missing while OPS_LLM_PROVIDER=groq (ops tasks may not work)")
+        if AsyncGroq is None:
+            log.warning("groq package is not installed but OPS_LLM_PROVIDER=groq (ops tasks may not work)")
+    else:
+        if not VENICE_API_KEY:
+            log.warning("VENICE_API_KEY is missing while OPS_LLM_PROVIDER=venice (ops tasks may not work)")
 
 # === Команды ===
 GAME_TITLE = os.getenv("GAME_TITLE", "Пидор дня")
@@ -518,6 +630,8 @@ def parse_llm_scope(value: str) -> str | None:
         return "chat"
     if normalized in ("game", "игра"):
         return "game"
+    if normalized in ("ops", "operational", "оперативка", "оперативный", "служебный", "служебка"):
+        return "ops"
     return None
 
 def normalize_spaces(value: str) -> str:
@@ -614,6 +728,24 @@ VENICE_RESPONSE_FORMAT_PROACTIVE_CHATBOT = {
                 "text": {"type": "string"},
             },
             "required": ["respond", "reply", "text"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+VENICE_RESPONSE_FORMAT_PROACTIVE_REACTION = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "proactive_reaction",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "react": {"type": "boolean"},
+                "reaction_id": {"type": "integer"},
+                "reason": {"type": "string"},
+            },
+            "required": ["react", "reaction_id", "reason"],
             "additionalProperties": False,
         },
     },
@@ -1213,7 +1345,7 @@ async def update_chat_summary(peer_id: int):
         return
     if not CHATBOT_ENABLED:
         return
-    provider, _, _, _, _ = get_llm_settings("chat")
+    provider, _, _, _, _ = get_llm_settings("ops")
     if provider == "groq":
         if not GROQ_API_KEY or AsyncGroq is None:
             return
@@ -1230,17 +1362,32 @@ async def update_chat_summary(peer_id: int):
         if last_conv_id > 0:
             new_rows = await fetch_messages_for_summary_since(peer_id, last_conv_id, CHAT_SUMMARY_MAX_NEW_MESSAGES)
             if len(new_rows) < CHAT_SUMMARY_MIN_NEW_MESSAGES:
+                CHAT_SUMMARY_LAST_TRIGGER_TS_BY_PEER.pop(peer_id, None)
+                CHAT_SUMMARY_PENDING_BY_PEER[peer_id] = max(
+                    int(CHAT_SUMMARY_PENDING_BY_PEER.get(peer_id, 0) or 0),
+                    max(0, CHAT_SUMMARY_EVERY_MESSAGES - 1),
+                )
                 return
         else:
             new_rows = await fetch_messages_for_summary_bootstrap(peer_id, CHAT_SUMMARY_BOOTSTRAP_MESSAGES)
             if len(new_rows) < CHAT_SUMMARY_MIN_NEW_MESSAGES:
+                CHAT_SUMMARY_LAST_TRIGGER_TS_BY_PEER.pop(peer_id, None)
+                CHAT_SUMMARY_PENDING_BY_PEER[peer_id] = max(
+                    int(CHAT_SUMMARY_PENDING_BY_PEER.get(peer_id, 0) or 0),
+                    max(0, CHAT_SUMMARY_EVERY_MESSAGES - 1),
+                )
                 return
 
         transcript, new_last_conv_id, new_last_ts = format_summary_transcript(new_rows)
         if not transcript:
+            CHAT_SUMMARY_LAST_TRIGGER_TS_BY_PEER.pop(peer_id, None)
+            CHAT_SUMMARY_PENDING_BY_PEER[peer_id] = max(
+                int(CHAT_SUMMARY_PENDING_BY_PEER.get(peer_id, 0) or 0),
+                max(0, CHAT_SUMMARY_EVERY_MESSAGES - 1),
+            )
             return
 
-        # Резюме нужно для внутреннего контекста (не публикуется), поэтому здесь не используем guard.
+        # Это служебная сводка. Guard здесь не нужен: текст не исполняется, а только добавляется в контекст.
         prompt = (
             f"Прошлая сводка:\n{old_summary.strip() if old_summary else '—'}\n\n"
             f"Новые сообщения:\n{transcript}\n\n"
@@ -1254,7 +1401,7 @@ async def update_chat_summary(peer_id: int):
             updated = await fetch_llm_messages(
                 llm_messages,
                 max_tokens=CHAT_SUMMARY_MAX_TOKENS,
-                target="chat",
+                target="ops",
             )
         except Exception as e:
             log.debug("Chat summary update failed peer_id=%s: %s", peer_id, e)
@@ -1267,7 +1414,19 @@ async def update_chat_summary(peer_id: int):
         # Если почему-то не продвинулись, не пишем назад в БД.
         if new_last_conv_id <= last_conv_id and new_last_ts <= last_ts:
             return
+        old_summary_clean = (old_summary or "").strip()
         await save_chat_summary(peer_id, updated, new_last_conv_id, new_last_ts)
+        if CHAT_SUMMARY_POST_ENABLED and updated != old_summary_clean:
+            summary_for_post = trim_text(updated, CHAT_SUMMARY_POST_MAX_CHARS)
+            if summary_for_post:
+                text_for_post = f"{CHAT_SUMMARY_POST_PREFIX}{summary_for_post}" if CHAT_SUMMARY_POST_PREFIX else summary_for_post
+                await send_peer_message(
+                    peer_id,
+                    text_for_post,
+                    max_chars=VK_MESSAGE_MAX_CHARS,
+                    max_parts=3,
+                    tail_note="\n\n(сводка обрезана)",
+                )
         log.debug(
             "Chat summary updated peer_id=%s chars=%s last_conv_id=%s",
             peer_id,
@@ -1475,7 +1634,11 @@ def schedule_user_memory_update(peer_id: int, user_id: int):
     key = (int(peer_id), int(user_id))
     pending = USER_MEMORY_PENDING_BY_KEY.get(key, 0) + 1
     USER_MEMORY_PENDING_BY_KEY[key] = pending
-    if pending < CHAT_USER_MEMORY_EVERY_MESSAGES:
+    cached = USER_MEMORY_CACHE_BY_KEY.get(key)
+    has_cached_memory = bool(cached and str(cached[0] or "").strip())
+    bootstrap_threshold = max(1, min(CHAT_USER_MEMORY_BOOTSTRAP_MIN_NEW_MESSAGES, CHAT_USER_MEMORY_EVERY_MESSAGES))
+    should_bootstrap = (not has_cached_memory) and pending >= bootstrap_threshold
+    if pending < CHAT_USER_MEMORY_EVERY_MESSAGES and not should_bootstrap:
         return
     existing_lock = USER_MEMORY_LOCKS_BY_KEY.get(key)
     if existing_lock is not None and existing_lock.locked():
@@ -1488,7 +1651,7 @@ def schedule_user_memory_update(peer_id: int, user_id: int):
     USER_MEMORY_LAST_TRIGGER_TS_BY_KEY[key] = now_ts
     asyncio.create_task(update_user_memory(peer_id, user_id))
 
-async def update_user_memory(peer_id: int, user_id: int):
+async def update_user_memory(peer_id: int, user_id: int, *, force: bool = False):
     if not CHAT_USER_MEMORY_ENABLED:
         return
     if not peer_id or peer_id < 2_000_000_000:
@@ -1499,7 +1662,7 @@ async def update_user_memory(peer_id: int, user_id: int):
         return
     if not CHATBOT_ENABLED:
         return
-    provider, _, _, _, _ = get_llm_settings("chat")
+    provider, _, _, _, _ = get_llm_settings("ops")
     if provider == "groq":
         if not GROQ_API_KEY or AsyncGroq is None:
             return
@@ -1512,7 +1675,17 @@ async def update_user_memory(peer_id: int, user_id: int):
 
     lock = _get_user_memory_lock(peer_id, user_id)
     async with lock:
-        old_summary, _, last_conv_id, last_ts = await load_user_memory(peer_id, user_id)
+        old_summary, updated_at, last_conv_id, last_ts = await load_user_memory(peer_id, user_id)
+        old_summary_clean = (old_summary or "").strip()
+        if (
+            force
+            and old_summary_clean
+            and CHAT_USER_MEMORY_FORCE_COOLDOWN_SECONDS > 0
+            and updated_at > 0
+            and current_timestamp() - int(updated_at) < CHAT_USER_MEMORY_FORCE_COOLDOWN_SECONDS
+        ):
+            return
+
         if last_conv_id > 0:
             new_rows = await fetch_user_messages_since(
                 peer_id,
@@ -1520,19 +1693,45 @@ async def update_user_memory(peer_id: int, user_id: int):
                 last_conv_id,
                 CHAT_USER_MEMORY_MAX_NEW_MESSAGES,
             )
-            if len(new_rows) < CHAT_USER_MEMORY_MIN_NEW_MESSAGES:
+            min_required = 1 if force else CHAT_USER_MEMORY_MIN_NEW_MESSAGES
+            if len(new_rows) < min_required:
+                if not force:
+                    key = (int(peer_id), int(user_id))
+                    USER_MEMORY_LAST_TRIGGER_TS_BY_KEY.pop(key, None)
+                    USER_MEMORY_PENDING_BY_KEY[key] = max(
+                        int(USER_MEMORY_PENDING_BY_KEY.get(key, 0) or 0),
+                        max(0, CHAT_USER_MEMORY_EVERY_MESSAGES - 1),
+                    )
                 return
         else:
             new_rows = await fetch_user_messages_bootstrap(peer_id, user_id, CHAT_USER_MEMORY_BOOTSTRAP_MESSAGES)
-            if len(new_rows) < CHAT_USER_MEMORY_MIN_NEW_MESSAGES:
+            min_required = 1 if force else min(
+                CHAT_USER_MEMORY_MIN_NEW_MESSAGES,
+                CHAT_USER_MEMORY_BOOTSTRAP_MIN_NEW_MESSAGES,
+            )
+            if len(new_rows) < min_required:
+                if not force:
+                    key = (int(peer_id), int(user_id))
+                    USER_MEMORY_LAST_TRIGGER_TS_BY_KEY.pop(key, None)
+                    USER_MEMORY_PENDING_BY_KEY[key] = max(
+                        int(USER_MEMORY_PENDING_BY_KEY.get(key, 0) or 0),
+                        max(0, CHAT_USER_MEMORY_EVERY_MESSAGES - 1),
+                    )
                 return
 
         transcript, new_last_conv_id, new_last_ts = format_user_memory_transcript(new_rows)
         if not transcript:
+            if not force:
+                key = (int(peer_id), int(user_id))
+                USER_MEMORY_LAST_TRIGGER_TS_BY_KEY.pop(key, None)
+                USER_MEMORY_PENDING_BY_KEY[key] = max(
+                    int(USER_MEMORY_PENDING_BY_KEY.get(key, 0) or 0),
+                    max(0, CHAT_USER_MEMORY_EVERY_MESSAGES - 1),
+                )
             return
 
         prompt = (
-            f"Прошлые заметки:\n{old_summary.strip() if old_summary else '—'}\n\n"
+            f"Прошлые заметки:\n{old_summary_clean if old_summary_clean else '—'}\n\n"
             f"Новые сообщения пользователя:\n{transcript}\n\n"
             "Обнови заметки."
         )
@@ -1544,7 +1743,7 @@ async def update_user_memory(peer_id: int, user_id: int):
             updated = await fetch_llm_messages(
                 llm_messages,
                 max_tokens=CHAT_USER_MEMORY_MAX_TOKENS,
-                target="chat",
+                target="ops",
             )
         except Exception as e:
             log.debug("User memory update failed peer_id=%s user_id=%s: %s", peer_id, user_id, e)
@@ -1557,11 +1756,12 @@ async def update_user_memory(peer_id: int, user_id: int):
             return
         await save_user_memory(peer_id, user_id, updated, new_last_conv_id, new_last_ts)
         log.debug(
-            "User memory updated peer_id=%s user_id=%s chars=%s last_conv_id=%s",
+            "User memory updated peer_id=%s user_id=%s chars=%s last_conv_id=%s force=%s",
             peer_id,
             user_id,
             len(updated),
             new_last_conv_id,
+            int(bool(force)),
         )
 
 async def build_user_memory_prompt(peer_id: int, user_id: int) -> str:
@@ -2334,6 +2534,7 @@ def build_bot_settings_defaults() -> dict[str, str]:
     return {
         "LLM_PROVIDER": setting_to_text(LLM_PROVIDER),
         "CHAT_LLM_PROVIDER": setting_to_text(CHAT_LLM_PROVIDER),
+        "OPS_LLM_PROVIDER": setting_to_text(OPS_LLM_PROVIDER),
         "GROQ_API_KEY": setting_to_text(GROQ_API_KEY),
         "VENICE_API_KEY": setting_to_text(VENICE_API_KEY),
         "GROQ_MODEL": setting_to_text(GROQ_MODEL),
@@ -2344,6 +2545,10 @@ def build_bot_settings_defaults() -> dict[str, str]:
         "CHAT_VENICE_MODEL": setting_to_text(CHAT_VENICE_MODEL),
         "CHAT_GROQ_TEMPERATURE": setting_to_text(CHAT_GROQ_TEMPERATURE),
         "CHAT_VENICE_TEMPERATURE": setting_to_text(CHAT_VENICE_TEMPERATURE),
+        "OPS_GROQ_MODEL": setting_to_text(OPS_GROQ_MODEL),
+        "OPS_VENICE_MODEL": setting_to_text(OPS_VENICE_MODEL),
+        "OPS_GROQ_TEMPERATURE": setting_to_text(OPS_GROQ_TEMPERATURE),
+        "OPS_VENICE_TEMPERATURE": setting_to_text(OPS_VENICE_TEMPERATURE),
         "CHATBOT_ENABLED": "1" if CHATBOT_ENABLED else "0",
         "CHATBOT_PROACTIVE_ENABLED": "1" if CHATBOT_PROACTIVE_ENABLED else "0",
         "CHAT_SUMMARY_ENABLED": "1" if CHAT_SUMMARY_ENABLED else "0",
@@ -2366,6 +2571,7 @@ async def set_bot_setting(key: str, value: str):
 def apply_bot_settings(settings: dict[str, str]):
     global LLM_PROVIDER
     global CHAT_LLM_PROVIDER
+    global OPS_LLM_PROVIDER
     global GROQ_API_KEY
     global VENICE_API_KEY
     global GROQ_MODEL
@@ -2376,6 +2582,10 @@ def apply_bot_settings(settings: dict[str, str]):
     global CHAT_VENICE_MODEL
     global CHAT_GROQ_TEMPERATURE
     global CHAT_VENICE_TEMPERATURE
+    global OPS_GROQ_MODEL
+    global OPS_VENICE_MODEL
+    global OPS_GROQ_TEMPERATURE
+    global OPS_VENICE_TEMPERATURE
     global CHATBOT_ENABLED
     global CHATBOT_PROACTIVE_ENABLED
     global CHAT_SUMMARY_ENABLED
@@ -2393,6 +2603,12 @@ def apply_bot_settings(settings: dict[str, str]):
     chat_provider = (settings.get("CHAT_LLM_PROVIDER") or "").strip().lower()
     if chat_provider in ("groq", "venice"):
         CHAT_LLM_PROVIDER = chat_provider
+
+    ops_provider = (settings.get("OPS_LLM_PROVIDER") or "").strip().lower()
+    if ops_provider in ("groq", "venice"):
+        OPS_LLM_PROVIDER = ops_provider
+    else:
+        OPS_LLM_PROVIDER = CHAT_LLM_PROVIDER
 
     groq_key = (settings.get("GROQ_API_KEY") or "").strip()
     GROQ_API_KEY = groq_key or None
@@ -2416,10 +2632,24 @@ def apply_bot_settings(settings: dict[str, str]):
     if chat_venice_model:
         CHAT_VENICE_MODEL = chat_venice_model
 
+    ops_groq_model = (settings.get("OPS_GROQ_MODEL") or "").strip()
+    if ops_groq_model:
+        OPS_GROQ_MODEL = ops_groq_model
+    else:
+        OPS_GROQ_MODEL = CHAT_GROQ_MODEL
+
+    ops_venice_model = (settings.get("OPS_VENICE_MODEL") or "").strip()
+    if ops_venice_model:
+        OPS_VENICE_MODEL = ops_venice_model
+    else:
+        OPS_VENICE_MODEL = CHAT_VENICE_MODEL
+
     GROQ_TEMPERATURE = parse_setting_float(settings.get("GROQ_TEMPERATURE"), GROQ_TEMPERATURE)
     VENICE_TEMPERATURE = parse_setting_float(settings.get("VENICE_TEMPERATURE"), VENICE_TEMPERATURE)
     CHAT_GROQ_TEMPERATURE = parse_setting_float(settings.get("CHAT_GROQ_TEMPERATURE"), CHAT_GROQ_TEMPERATURE)
     CHAT_VENICE_TEMPERATURE = parse_setting_float(settings.get("CHAT_VENICE_TEMPERATURE"), CHAT_VENICE_TEMPERATURE)
+    OPS_GROQ_TEMPERATURE = parse_setting_float(settings.get("OPS_GROQ_TEMPERATURE"), OPS_GROQ_TEMPERATURE)
+    OPS_VENICE_TEMPERATURE = parse_setting_float(settings.get("OPS_VENICE_TEMPERATURE"), OPS_VENICE_TEMPERATURE)
 
     CHATBOT_ENABLED = parse_setting_bool(settings.get("CHATBOT_ENABLED"), CHATBOT_ENABLED)
     CHATBOT_PROACTIVE_ENABLED = parse_setting_bool(
@@ -2453,14 +2683,19 @@ def apply_bot_settings(settings: dict[str, str]):
 
     os.environ["LLM_PROVIDER"] = LLM_PROVIDER
     os.environ["CHAT_LLM_PROVIDER"] = CHAT_LLM_PROVIDER
+    os.environ["OPS_LLM_PROVIDER"] = OPS_LLM_PROVIDER
     os.environ["GROQ_MODEL"] = GROQ_MODEL
     os.environ["VENICE_MODEL"] = VENICE_MODEL
     os.environ["CHAT_GROQ_MODEL"] = CHAT_GROQ_MODEL
     os.environ["CHAT_VENICE_MODEL"] = CHAT_VENICE_MODEL
+    os.environ["OPS_GROQ_MODEL"] = OPS_GROQ_MODEL
+    os.environ["OPS_VENICE_MODEL"] = OPS_VENICE_MODEL
     os.environ["GROQ_TEMPERATURE"] = str(GROQ_TEMPERATURE)
     os.environ["VENICE_TEMPERATURE"] = str(VENICE_TEMPERATURE)
     os.environ["CHAT_GROQ_TEMPERATURE"] = str(CHAT_GROQ_TEMPERATURE)
     os.environ["CHAT_VENICE_TEMPERATURE"] = str(CHAT_VENICE_TEMPERATURE)
+    os.environ["OPS_GROQ_TEMPERATURE"] = str(OPS_GROQ_TEMPERATURE)
+    os.environ["OPS_VENICE_TEMPERATURE"] = str(OPS_VENICE_TEMPERATURE)
     os.environ["CHATBOT_ENABLED"] = "1" if CHATBOT_ENABLED else "0"
     os.environ["CHATBOT_PROACTIVE_ENABLED"] = "1" if CHATBOT_PROACTIVE_ENABLED else "0"
     os.environ["CHAT_SUMMARY_ENABLED"] = "1" if CHAT_SUMMARY_ENABLED else "0"
@@ -2623,6 +2858,23 @@ async def init_db():
 
 # ================= LLM ЗАПРОСЫ =================
 def get_llm_settings(target: str) -> tuple[str, str, float, str, float]:
+    if target == "ops":
+        return (
+            OPS_LLM_PROVIDER,
+            OPS_GROQ_MODEL,
+            OPS_GROQ_TEMPERATURE,
+            OPS_VENICE_MODEL,
+            OPS_VENICE_TEMPERATURE,
+        )
+    if target == "reaction":
+        reaction_provider, reaction_groq_model, reaction_groq_temperature, reaction_venice_model, reaction_venice_temperature = get_llm_settings("ops")
+        return (
+            reaction_provider,
+            reaction_groq_model,
+            reaction_groq_temperature,
+            reaction_venice_model,
+            reaction_venice_temperature,
+        )
     if target == "chat":
         return (
             CHAT_LLM_PROVIDER,
@@ -2783,6 +3035,100 @@ async def ensure_chat_guard(messages: list):
     if matched:
         raise ChatGuardBlocked(",".join(matched))
 
+def choose_venice_reasoning_profile(
+    messages: list,
+    *,
+    target: str,
+    max_tokens: int,
+) -> tuple[str | None, bool, str, int]:
+    is_chat = target == "chat"
+    mode = CHAT_VENICE_REASONING_MODE if is_chat else VENICE_REASONING_MODE
+    fixed_effort = CHAT_VENICE_REASONING_EFFORT if is_chat else VENICE_REASONING_EFFORT
+    base_disable_thinking = CHAT_VENICE_DISABLE_THINKING if is_chat else VENICE_DISABLE_THINKING
+    light_disable_thinking = (
+        CHAT_VENICE_AUTO_LIGHT_DISABLE_THINKING
+        if is_chat
+        else VENICE_AUTO_LIGHT_DISABLE_THINKING
+    )
+
+    if mode != "auto":
+        effort = None if base_disable_thinking else fixed_effort
+        return effort, bool(base_disable_thinking), "fixed", 0
+
+    total_chars = 0
+    non_system_messages = 0
+    last_user_text = ""
+    for item in messages or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role == "system":
+            continue
+        content = item.get("content")
+        if content is None:
+            continue
+        text = str(content).strip()
+        if not text:
+            continue
+        non_system_messages += 1
+        total_chars += len(text)
+        if role == "user":
+            last_user_text = text
+
+    user_chars = len(last_user_text)
+    score = 0
+    if user_chars >= VENICE_AUTO_LONG_CHARS:
+        score += 2
+    elif user_chars >= VENICE_AUTO_SHORT_CHARS:
+        score += 1
+
+    if total_chars >= VENICE_AUTO_HEAVY_TRANSCRIPT_CHARS:
+        score += 2
+    elif total_chars >= max(200, VENICE_AUTO_HEAVY_TRANSCRIPT_CHARS // 2):
+        score += 1
+
+    if non_system_messages >= VENICE_AUTO_HEAVY_MESSAGES:
+        score += 1
+
+    if last_user_text and VENICE_AUTO_COMPLEX_HINTS_RE.search(last_user_text):
+        score += 2
+
+    if (
+        last_user_text
+        and user_chars <= 32
+        and VENICE_AUTO_SIMPLE_HINTS_RE.match(last_user_text)
+    ):
+        score -= 2
+
+    if max_tokens >= 320:
+        score += 1
+    elif max_tokens <= 140:
+        score -= 1
+
+    route = "light"
+    effort: str | None = None
+    disable_thinking = False
+    if score <= 1:
+        route = "light"
+        effort = None
+        disable_thinking = bool(light_disable_thinking)
+    elif score <= 4:
+        route = "medium"
+        effort = "low"
+    elif score <= 6:
+        route = "high"
+        effort = "medium"
+    else:
+        route = "ultra"
+        effort = "high"
+
+    # Explicit disable_thinking in config has priority over auto route.
+    if base_disable_thinking:
+        disable_thinking = True
+        effort = None
+
+    return effort, disable_thinking, route, score
+
 async def fetch_llm_messages(
     messages: list,
     max_tokens: int = None,
@@ -2804,10 +3150,12 @@ async def fetch_llm_messages(
             if target == "chat"
             else VENICE_STRIP_THINKING_RESPONSE
         )
-        disable_thinking = (
-            CHAT_VENICE_DISABLE_THINKING
-            if target == "chat"
-            else VENICE_DISABLE_THINKING
+        reasoning_effort, disable_thinking, reasoning_route, reasoning_score = (
+            choose_venice_reasoning_profile(
+                messages,
+                target=target,
+                max_tokens=max_tokens,
+            )
         )
         venice_parameters: dict = {
             "include_venice_system_prompt": VENICE_INCLUDE_SYSTEM_PROMPT,
@@ -2825,14 +3173,18 @@ async def fetch_llm_messages(
             "max_completion_tokens": max_tokens,
             "venice_parameters": venice_parameters,
         }
-        reasoning_effort = (
-            CHAT_VENICE_REASONING_EFFORT
-            if target == "chat"
-            else VENICE_REASONING_EFFORT
-        )
         if reasoning_effort:
             payload["reasoning"] = {"effort": reasoning_effort}
             payload["reasoning_effort"] = reasoning_effort
+        if reasoning_route != "fixed":
+            log.debug(
+                "Venice auto reasoning target=%s route=%s score=%s disable_thinking=%s effort=%s",
+                target,
+                reasoning_route,
+                reasoning_score,
+                disable_thinking,
+                reasoning_effort or "none",
+            )
         if venice_response_format is not None:
             payload["response_format"] = venice_response_format
 
@@ -3415,12 +3767,15 @@ async def show_settings(message: Message):
     log.debug("Settings requested peer_id=%s user_id=%s", message.peer_id, message.from_id)
     game_provider_label = "Groq" if LLM_PROVIDER == "groq" else "Venice"
     chat_provider_label = "Groq" if CHAT_LLM_PROVIDER == "groq" else "Venice"
+    ops_provider_label = "Groq" if OPS_LLM_PROVIDER == "groq" else "Venice"
     groq_key_short = GROQ_API_KEY[:5] + "..." if GROQ_API_KEY else "не задан"
     venice_key_short = VENICE_API_KEY[:5] + "..." if VENICE_API_KEY else "не задан"
     game_groq_marker = " ✅" if LLM_PROVIDER == "groq" else ""
     game_venice_marker = " ✅" if LLM_PROVIDER == "venice" else ""
     chat_groq_marker = " ✅" if CHAT_LLM_PROVIDER == "groq" else ""
     chat_venice_marker = " ✅" if CHAT_LLM_PROVIDER == "venice" else ""
+    ops_groq_marker = " ✅" if OPS_LLM_PROVIDER == "groq" else ""
+    ops_venice_marker = " ✅" if OPS_LLM_PROVIDER == "venice" else ""
     guard_status = "on" if CHAT_GROQ_GUARD_ENABLED else "off"
     guard_categories = ", ".join(sorted(CHAT_GROQ_GUARD_BLOCK_CATEGORIES_SET)) or "—"
     autoban_status = "on" if CHAT_GUARD_AUTOBAN_ENABLED else "off"
@@ -3444,8 +3799,16 @@ async def show_settings(message: Message):
     chatbot_status = "включен" if CHATBOT_ENABLED else "выключен"
     proactive_status = "включен" if CHATBOT_PROACTIVE_ENABLED else "выключен"
     reactions_status = "on" if CHATBOT_PROACTIVE_REACTIONS_ENABLED else "off"
+    reaction_provider, reaction_groq_model, _, reaction_venice_model, _ = get_llm_settings("reaction")
+    reaction_mode = "llm" if CHATBOT_PROACTIVE_REACTION_USE_LLM else "random"
+    reaction_model = (
+        reaction_groq_model
+        if reaction_provider == "groq"
+        else reaction_venice_model
+    )
     chat_context_status = "on" if CHAT_CONTEXT_ENABLED else "off"
     chat_summary_status = "on" if CHAT_SUMMARY_ENABLED else "off"
+    chat_summary_post_status = "on" if CHAT_SUMMARY_POST_ENABLED else "off"
     user_memory_status = "on" if CHAT_USER_MEMORY_ENABLED else "off"
     schedule_time = None
     leaderboard_day = None
@@ -3475,13 +3838,21 @@ async def show_settings(message: Message):
         f"💬 **Чатбот LLM:** активный `{chat_provider_label}`\n"
         f"• groq: `{CHAT_GROQ_MODEL}` (t `{CHAT_GROQ_TEMPERATURE}`){chat_groq_marker}\n"
         f"• venice: `{CHAT_VENICE_MODEL}` (t `{CHAT_VENICE_TEMPERATURE}`){chat_venice_marker}\n\n"
+        f"⚙️ **Служебный LLM (ops):** активный `{ops_provider_label}`\n"
+        f"• groq: `{OPS_GROQ_MODEL}` (t `{OPS_GROQ_TEMPERATURE}`){ops_groq_marker}\n"
+        f"• venice: `{OPS_VENICE_MODEL}` (t `{OPS_VENICE_TEMPERATURE}`){ops_venice_marker}\n\n"
         f"🔑 **Ключи:** groq `{groq_key_short}`, venice `{venice_key_short}`\n\n"
         f"🧠 **Venice reasoning:** strip chat `{int(bool(CHAT_VENICE_STRIP_THINKING_RESPONSE))}`, "
         f"game `{int(bool(VENICE_STRIP_THINKING_RESPONSE))}`, "
         f"disable chat `{int(bool(CHAT_VENICE_DISABLE_THINKING))}`, "
         f"game `{int(bool(VENICE_DISABLE_THINKING))}`, "
+        f"mode chat `{CHAT_VENICE_REASONING_MODE}`, game `{VENICE_REASONING_MODE}`, "
         f"effort chat `{CHAT_VENICE_REASONING_EFFORT or '—'}`, "
-        f"game `{VENICE_REASONING_EFFORT or '—'}`\n\n"
+        f"game `{VENICE_REASONING_EFFORT or '—'}`\n"
+        f"auto light->disable chat `{int(bool(CHAT_VENICE_AUTO_LIGHT_DISABLE_THINKING))}`, "
+        f"game `{int(bool(VENICE_AUTO_LIGHT_DISABLE_THINKING))}`, "
+        f"threshold chars `{VENICE_AUTO_SHORT_CHARS}/{VENICE_AUTO_LONG_CHARS}`, "
+        f"ctx `{VENICE_AUTO_HEAVY_TRANSCRIPT_CHARS}`, msgs `{VENICE_AUTO_HEAVY_MESSAGES}`\n\n"
         f"🛡 **Groq Guard (чат):** `{guard_status}`, блок: `{guard_categories}`\n\n"
         f"🚫 **Автобан (guard):** `{autoban_status}` — {autoban_line}\n\n"
         f"📦 **Провайдеры:** `groq`, `venice`\n"
@@ -3489,9 +3860,9 @@ async def show_settings(message: Message):
         f"🧭 **Peer ID:** `{message.peer_id}`\n"
         f"💬 **Чатбот:** `{chatbot_status}`\n"
         f"💭 **Proactive:** `{proactive_status}` (p `{CHATBOT_PROACTIVE_PROBABILITY}`, cd `{CHATBOT_PROACTIVE_COOLDOWN_SECONDS}`s)\n"
-        f"💟 **Реакции:** `{reactions_status}` (p `{CHATBOT_PROACTIVE_REACTION_PROBABILITY}`, cd `{CHATBOT_PROACTIVE_REACTION_COOLDOWN_SECONDS}`s)\n"
+        f"💟 **Реакции:** `{reactions_status}` ({reaction_mode}/{reaction_provider}:{reaction_model}, p `{CHATBOT_PROACTIVE_REACTION_PROBABILITY}`, cd `{CHATBOT_PROACTIVE_REACTION_COOLDOWN_SECONDS}`s)\n"
         f"🧠 **Контекст чата:** `{chat_context_status}` (посл. `{CHAT_CONTEXT_LIMIT}`)\n"
-        f"📝 **Сводка чата:** `{chat_summary_status}` (каждые `{CHAT_SUMMARY_EVERY_MESSAGES}`, cd `{CHAT_SUMMARY_COOLDOWN_SECONDS}`s)\n"
+        f"📝 **Сводка чата:** `{chat_summary_status}` (каждые `{CHAT_SUMMARY_EVERY_MESSAGES}`, cd `{CHAT_SUMMARY_COOLDOWN_SECONDS}`s, post `{chat_summary_post_status}`)\n"
         f"🧩 **Память (люди):** `{user_memory_status}` (каждые `{CHAT_USER_MEMORY_EVERY_MESSAGES}`, cd `{CHAT_USER_MEMORY_COOLDOWN_SECONDS}`s)\n"
         f"🔢 **Токены (max_completion_tokens):** chat `{CHAT_MAX_TOKENS}`, game `{LLM_MAX_TOKENS}`\n"
         f"📏 **Лимит ответа (чат):** `{CHAT_RESPONSE_MAX_CHARS}` символов\n"
@@ -3499,16 +3870,17 @@ async def show_settings(message: Message):
         f"{schedule_line}\n"
         f"{leaderboard_line}\n"
         f"**⚙ Команды:**\n"
-        f"• `{CMD_SET_PROVIDER} [chat|game] groq|venice` - Выбрать провайдера\n"
-        f"• `{CMD_SET_MODEL} [chat|game] <провайдер> <id>` - Сменить модель\n"
+        f"• `{CMD_SET_PROVIDER} [chat|game|ops] groq|venice` - Выбрать провайдера\n"
+        f"• `{CMD_SET_MODEL} [chat|game|ops] <провайдер> <id>` - Сменить модель\n"
         f"• `{CMD_SET_KEY} <провайдер> <ключ>` - Новый API ключ\n"
-        f"• `{CMD_SET_TEMPERATURE} [chat|game] <0.0-2.0>` - Установить температуру\n"
+        f"• `{CMD_SET_TEMPERATURE} [chat|game|ops] <0.0-2.0>` - Установить температуру\n"
         f"• `{CMD_LIST_MODELS} <провайдер>` - Список моделей (Live)\n\n"
         f"• `{CMD_PROMPT}` или `{CMD_PROMPT} <текст>` - Показать/обновить user prompt\n\n"
         f"**💬 Чатбот:**\n"
         f"• `{CMD_CHATBOT} on|off` - Включить/выключить чатбота\n"
         f"• `{CMD_CHATBOT} pro on|off` - Включить/выключить proactive режим\n"
         f"• `{CMD_CHATBOT} sum on|off` - Включить/выключить сводку чата\n"
+        f"• `{CMD_CHATBOT} sum show|now` - Показать/обновить и показать сводку\n"
         f"• `{CMD_CHATBOT} mem on|off` - Включить/выключить память по участникам\n"
         f"• `{CMD_MEMORY}` или `{CMD_MEMORY} сброс` - Показать/сбросить твою память\n"
         f"• `{CMD_TOKENS} [chat|game] <число>` - Лимит токенов ответа модели\n"
@@ -3641,7 +4013,7 @@ async def chatbot_toggle_handler(message: Message):
             f"Команды:\n"
             f"• `{CMD_CHATBOT} on|off`\n"
             f"• `{CMD_CHATBOT} pro on|off`\n"
-            f"• `{CMD_CHATBOT} sum on|off`\n"
+            f"• `{CMD_CHATBOT} sum on|off|show|now`\n"
             f"• `{CMD_CHATBOT} mem on|off`",
         )
         return
@@ -3667,7 +4039,7 @@ async def chatbot_toggle_handler(message: Message):
             return
 
         if new_state and not CHATBOT_PROACTIVE_ENABLED:
-            provider, _, _, _, _ = get_llm_settings("chat")
+            provider, _, _, _, _ = get_llm_settings("ops")
             if provider == "groq":
                 if not GROQ_API_KEY:
                     await send_reply(message, "❌ Нельзя включить proactive: не найден GROQ_API_KEY.")
@@ -3705,20 +4077,49 @@ async def chatbot_toggle_handler(message: Message):
             sum_status = "on" if CHAT_SUMMARY_ENABLED else "off"
             await send_reply(
                 message,
-                f"📝 Сводка чата сейчас `{sum_status}`.\nКоманда: `{CMD_CHATBOT} sum on` или `{CMD_CHATBOT} sum off`",
+                f"📝 Сводка чата сейчас `{sum_status}`.\n"
+                f"Команды: `{CMD_CHATBOT} sum on|off`, `{CMD_CHATBOT} sum show`, `{CMD_CHATBOT} sum now`",
             )
             return
         sum_arg = parts[1].strip().lower()
+        if sum_arg in {"show", "показать", "view", "status"}:
+            summary, updated_at, _, _ = await load_chat_summary(message.peer_id)
+            summary = (summary or "").strip()
+            if not summary:
+                await send_reply(message, "📝 Сводка пока пустая.")
+                return
+            updated_label = format_msk_time(updated_at) if updated_at else "—"
+            await send_reply(
+                message,
+                f"📝 Сводка чата (обновлено {updated_label}):\n{summary}",
+            )
+            return
+        if sum_arg in {"now", "refresh", "обнови", "обновить", "сейчас"}:
+            if not CHAT_SUMMARY_ENABLED:
+                await send_reply(message, f"💤 Сводка чата выключена.\nВключи: `{CMD_CHATBOT} sum on`")
+                return
+            await update_chat_summary(message.peer_id)
+            summary, updated_at, _, _ = await load_chat_summary(message.peer_id)
+            summary = (summary or "").strip()
+            if not summary:
+                await send_reply(message, "📝 Сводка пока пустая.")
+                return
+            updated_label = format_msk_time(updated_at) if updated_at else "—"
+            await send_reply(
+                message,
+                f"📝 Сводка чата (обновлено {updated_label}):\n{summary}",
+            )
+            return
         if sum_arg in enable_values:
             new_state = True
         elif sum_arg in disable_values:
             new_state = False
         else:
-            await send_reply(message, "❌ Неверный аргумент. Используй: sum on/off.")
+            await send_reply(message, "❌ Неверный аргумент. Используй: sum on/off/show/now.")
             return
 
         if new_state and not CHAT_SUMMARY_ENABLED:
-            provider, _, _, _, _ = get_llm_settings("chat")
+            provider, _, _, _, _ = get_llm_settings("ops")
             if provider == "groq":
                 if not GROQ_API_KEY:
                     await send_reply(message, "❌ Нельзя включить сводку: не найден GROQ_API_KEY.")
@@ -3771,7 +4172,7 @@ async def chatbot_toggle_handler(message: Message):
             return
 
         if new_state and not CHAT_USER_MEMORY_ENABLED:
-            provider, _, _, _, _ = get_llm_settings("chat")
+            provider, _, _, _, _ = get_llm_settings("ops")
             if provider == "groq":
                 if not GROQ_API_KEY:
                     await send_reply(message, "❌ Нельзя включить память: не найден GROQ_API_KEY.")
@@ -3803,7 +4204,7 @@ async def chatbot_toggle_handler(message: Message):
             f"✅ Память по участникам теперь {'включена' if CHAT_USER_MEMORY_ENABLED else 'выключена'}.{note}",
         )
         if CHAT_USER_MEMORY_ENABLED and message.peer_id >= 2_000_000_000 and message.from_id and message.from_id > 0:
-            asyncio.create_task(update_user_memory(message.peer_id, message.from_id))
+            asyncio.create_task(update_user_memory(message.peer_id, message.from_id, force=True))
         return
 
     if normalized in enable_values:
@@ -3902,6 +4303,10 @@ async def memory_handler(message: Message):
     summary, updated_at, _, _ = await load_user_memory(message.peer_id, target_user_id)
     summary = (summary or "").strip()
     if not summary:
+        await update_user_memory(message.peer_id, target_user_id, force=True)
+        summary, updated_at, _, _ = await load_user_memory(message.peer_id, target_user_id)
+        summary = (summary or "").strip()
+    if not summary:
         await send_reply(
             message,
             "Память пока пустая. Я еще не успел собрать заметки.\n"
@@ -3990,6 +4395,15 @@ async def tokens_handler(message: Message):
         if len(parts) > 1:
             await send_reply(message, "❌ Неверный формат. Пример: `/токены chat 600` или `/токены 600`")
             return
+
+    if scope == "ops":
+        await send_reply(
+            message,
+            "❌ Для `ops` общий лимит токенов не используется.\n"
+            "Настраивается отдельно: `CHATBOT_PROACTIVE_MAX_TOKENS`, `CHAT_SUMMARY_MAX_TOKENS`, "
+            "`CHAT_USER_MEMORY_MAX_TOKENS`, `CHATBOT_PROACTIVE_REACTION_MAX_TOKENS`.",
+        )
+        return
 
     try:
         value = int(value_str or "")
@@ -4124,7 +4538,7 @@ async def leaderboard_handler(message: Message):
 async def set_model_handler(message: Message):
     if not await ensure_command_allowed(message, CMD_SET_MODEL):
         return
-    global GROQ_MODEL, VENICE_MODEL, CHAT_GROQ_MODEL, CHAT_VENICE_MODEL
+    global GROQ_MODEL, VENICE_MODEL, CHAT_GROQ_MODEL, CHAT_VENICE_MODEL, OPS_GROQ_MODEL, OPS_VENICE_MODEL
     args = strip_command(message.text, CMD_SET_MODEL)
     if not args:
         await send_reply(message, f"❌ Укажи провайдера и модель!\nПример: `{CMD_SET_MODEL} groq llama-3.3-70b-versatile`")
@@ -4135,7 +4549,7 @@ async def set_model_handler(message: Message):
         if len(parts) < 3:
             await send_reply(
                 message,
-                f"❌ Укажи зону (chat|game), провайдера и модель!\nПример: `{CMD_SET_MODEL} chat venice openai-gpt-oss-120b`",
+                f"❌ Укажи зону (chat|game|ops), провайдера и модель!\nПример: `{CMD_SET_MODEL} ops venice openai-gpt-oss-120b`",
             )
             return
         provider, model_id = parts[1].lower(), parts[2].strip()
@@ -4166,6 +4580,24 @@ async def set_model_handler(message: Message):
                     f"Чтобы использовать эту модель: `{CMD_SET_PROVIDER} chat groq`"
                 )
             await send_reply(message, f"✅ Модель Groq (чатбот) изменена на: `{CHAT_GROQ_MODEL}`{note}")
+            return
+        if scope == "ops":
+            OPS_GROQ_MODEL = model_id
+            os.environ["OPS_GROQ_MODEL"] = model_id
+            await set_bot_setting("OPS_GROQ_MODEL", model_id)
+            log.info(
+                "Ops Groq model updated peer_id=%s user_id=%s model=%s",
+                message.peer_id,
+                message.from_id,
+                OPS_GROQ_MODEL,
+            )
+            note = ""
+            if OPS_LLM_PROVIDER != "groq":
+                note = (
+                    f"\nℹ️ Сейчас ops использует провайдер `{OPS_LLM_PROVIDER}`. "
+                    f"Чтобы использовать эту модель: `{CMD_SET_PROVIDER} ops groq`"
+                )
+            await send_reply(message, f"✅ Модель Groq (ops) изменена на: `{OPS_GROQ_MODEL}`{note}")
             return
         GROQ_MODEL = model_id
         os.environ["GROQ_MODEL"] = model_id
@@ -4202,6 +4634,24 @@ async def set_model_handler(message: Message):
             )
         await send_reply(message, f"✅ Модель Venice (чатбот) изменена на: `{CHAT_VENICE_MODEL}`{note}")
         return
+    if scope == "ops":
+        OPS_VENICE_MODEL = model_id
+        os.environ["OPS_VENICE_MODEL"] = model_id
+        await set_bot_setting("OPS_VENICE_MODEL", model_id)
+        log.info(
+            "Ops Venice model updated peer_id=%s user_id=%s model=%s",
+            message.peer_id,
+            message.from_id,
+            OPS_VENICE_MODEL,
+        )
+        note = ""
+        if OPS_LLM_PROVIDER != "venice":
+            note = (
+                f"\nℹ️ Сейчас ops использует провайдер `{OPS_LLM_PROVIDER}`. "
+                f"Чтобы использовать эту модель: `{CMD_SET_PROVIDER} ops venice`"
+            )
+        await send_reply(message, f"✅ Модель Venice (ops) изменена на: `{OPS_VENICE_MODEL}`{note}")
+        return
     VENICE_MODEL = model_id
     os.environ["VENICE_MODEL"] = model_id
     await set_bot_setting("VENICE_MODEL", model_id)
@@ -4223,10 +4673,13 @@ async def set_model_handler(message: Message):
 async def set_provider_handler(message: Message):
     if not await ensure_command_allowed(message, CMD_SET_PROVIDER):
         return
-    global LLM_PROVIDER, CHAT_LLM_PROVIDER, groq_client
+    global LLM_PROVIDER, CHAT_LLM_PROVIDER, OPS_LLM_PROVIDER, groq_client
     args = strip_command(message.text, CMD_SET_PROVIDER)
     if not args:
-        await send_reply(message, f"❌ Укажи провайдера!\nПример: `{CMD_SET_PROVIDER} groq` или `{CMD_SET_PROVIDER} chat venice`")
+        await send_reply(
+            message,
+            f"❌ Укажи провайдера!\nПример: `{CMD_SET_PROVIDER} groq` или `{CMD_SET_PROVIDER} ops venice`",
+        )
         return
     parts = args.split()
     scope = parse_llm_scope(parts[0]) if parts else None
@@ -4265,6 +4718,18 @@ async def set_provider_handler(message: Message):
             CHAT_LLM_PROVIDER,
         )
         await send_reply(message, f"✅ Провайдер чатбота изменен на: `{CHAT_LLM_PROVIDER}`")
+        return
+    if scope == "ops":
+        OPS_LLM_PROVIDER = provider
+        os.environ["OPS_LLM_PROVIDER"] = provider
+        await set_bot_setting("OPS_LLM_PROVIDER", provider)
+        log.info(
+            "Ops provider updated peer_id=%s user_id=%s provider=%s",
+            message.peer_id,
+            message.from_id,
+            OPS_LLM_PROVIDER,
+        )
+        await send_reply(message, f"✅ Провайдер ops изменен на: `{OPS_LLM_PROVIDER}`")
         return
     LLM_PROVIDER = provider
     os.environ["LLM_PROVIDER"] = provider
@@ -4328,9 +4793,13 @@ async def set_temperature_handler(message: Message):
     if not await ensure_command_allowed(message, CMD_SET_TEMPERATURE):
         return
     global GROQ_TEMPERATURE, VENICE_TEMPERATURE, CHAT_GROQ_TEMPERATURE, CHAT_VENICE_TEMPERATURE
+    global OPS_GROQ_TEMPERATURE, OPS_VENICE_TEMPERATURE
     args = strip_command(message.text, CMD_SET_TEMPERATURE)
     if not args:
-        await send_reply(message, f"❌ Укажи температуру!\nПример: `{CMD_SET_TEMPERATURE} 0.9` или `{CMD_SET_TEMPERATURE} chat 0.7`")
+        await send_reply(
+            message,
+            f"❌ Укажи температуру!\nПример: `{CMD_SET_TEMPERATURE} 0.9` или `{CMD_SET_TEMPERATURE} ops 0.7`",
+        )
         return
     parts = args.split(maxsplit=1)
     scope = parse_llm_scope(parts[0]) if parts else None
@@ -4373,6 +4842,31 @@ async def set_temperature_handler(message: Message):
             CHAT_VENICE_TEMPERATURE,
         )
         await send_reply(message, f"✅ Температура Venice (чатбот) установлена: `{CHAT_VENICE_TEMPERATURE}`")
+        return
+
+    if scope == "ops":
+        if OPS_LLM_PROVIDER == "groq":
+            OPS_GROQ_TEMPERATURE = value
+            os.environ["OPS_GROQ_TEMPERATURE"] = str(value)
+            await set_bot_setting("OPS_GROQ_TEMPERATURE", str(value))
+            log.info(
+                "Ops Groq temperature updated peer_id=%s user_id=%s value=%s",
+                message.peer_id,
+                message.from_id,
+                OPS_GROQ_TEMPERATURE,
+            )
+            await send_reply(message, f"✅ Температура Groq (ops) установлена: `{OPS_GROQ_TEMPERATURE}`")
+            return
+        OPS_VENICE_TEMPERATURE = value
+        os.environ["OPS_VENICE_TEMPERATURE"] = str(value)
+        await set_bot_setting("OPS_VENICE_TEMPERATURE", str(value))
+        log.info(
+            "Ops Venice temperature updated peer_id=%s user_id=%s value=%s",
+            message.peer_id,
+            message.from_id,
+            OPS_VENICE_TEMPERATURE,
+        )
+        await send_reply(message, f"✅ Температура Venice (ops) установлена: `{OPS_VENICE_TEMPERATURE}`")
         return
 
     if LLM_PROVIDER == "groq":
@@ -4534,6 +5028,117 @@ def _parse_boolish(value) -> bool | None:
             return False
     return None
 
+def _normalize_reaction_ids(values) -> list[int]:
+    normalized: list[int] = []
+    for value in values or []:
+        try:
+            rid = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= rid <= 16:
+            normalized.append(rid)
+    if not normalized:
+        return [1]
+    # Keep order from config but drop duplicates.
+    return list(dict.fromkeys(normalized))
+
+def _parse_reaction_id(value, allowed_reaction_ids: list[int]) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    candidate = None
+    if isinstance(value, (int, float)):
+        candidate = int(value)
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        match = re.search(r"\d+", text)
+        if not match:
+            return None
+        candidate = int(match.group(0))
+    if candidate in allowed_reaction_ids:
+        return candidate
+    return None
+
+async def choose_proactive_reaction_via_llm(
+    message: Message,
+    peer_id: int,
+    cmid: int,
+    allowed_reaction_ids: list[int],
+) -> tuple[bool, int | None]:
+    text = str(message.text or "").strip()
+    if not text:
+        return False, None
+
+    now_ts = int(datetime.datetime.now(MSK_TZ).timestamp())
+    author_name = USER_NAME_CACHE.get(message.from_id) or ""
+    if not author_name:
+        try:
+            user_info = await message.get_user()
+            author_name = f"{user_info.first_name} {user_info.last_name}"
+        except Exception:
+            author_name = f"id{message.from_id}"
+        USER_NAME_CACHE[message.from_id] = author_name
+    USER_NAME_CACHE_LAST_SEEN_TS[int(message.from_id)] = int(now_ts)
+
+    llm_messages = [{"role": "system", "content": CHATBOT_PROACTIVE_REACTION_SYSTEM_PROMPT}]
+    summary_prompt = await build_chat_summary_prompt(peer_id)
+    if summary_prompt:
+        llm_messages.append({"role": "system", "content": summary_prompt})
+    if CHAT_CONTEXT_ENABLED:
+        peer_turns = await build_peer_chat_messages(
+            peer_id,
+            limit=min(12, CHAT_CONTEXT_LIMIT),
+            max_chars=min(1800, CHAT_CONTEXT_MAX_CHARS),
+            line_max_chars=CHAT_CONTEXT_LINE_MAX_CHARS,
+            exclude_conversation_message_id=cmid,
+        )
+        if peer_turns:
+            llm_messages.append({"role": "system", "content": CHAT_CONTEXT_GUARD_PROMPT})
+            llm_messages.extend(peer_turns)
+
+    allowed_line = ", ".join(str(rid) for rid in allowed_reaction_ids)
+    current_line = f"{author_name} ({message.from_id}): {trim_text_middle(text, CHAT_CONTEXT_LINE_MAX_CHARS)}"
+    llm_messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"Доступные reaction_id: [{allowed_line}].\n"
+                f"Текущее сообщение:\n{current_line}\n"
+                "Реши, уместна ли реакция."
+            ),
+        }
+    )
+
+    reaction_provider, _, _, _, _ = get_llm_settings("reaction")
+    venice_response_format = (
+        VENICE_RESPONSE_FORMAT_PROACTIVE_REACTION
+        if reaction_provider == "venice"
+        else None
+    )
+    response_raw = await fetch_llm_messages(
+        llm_messages,
+        max_tokens=CHATBOT_PROACTIVE_REACTION_MAX_TOKENS,
+        target="reaction",
+        venice_response_format=venice_response_format,
+    )
+    parsed = try_parse_json_object(response_raw)
+    if parsed is None:
+        raise ValueError("Reaction LLM returned non-JSON response")
+
+    react = _parse_boolish(parsed.get("react"))
+    if react is not True:
+        return False, None
+
+    reaction_id = _parse_reaction_id(parsed.get("reaction_id"), allowed_reaction_ids)
+    if reaction_id is None:
+        reaction_id = _parse_reaction_id(parsed.get("reaction"), allowed_reaction_ids)
+    if reaction_id is None:
+        reaction_id = int(random.choice(allowed_reaction_ids))
+    return True, reaction_id
+
 async def maybe_send_proactive_reaction(message: Message, peer_id: int) -> bool:
     if not CHATBOT_PROACTIVE_REACTIONS_ENABLED:
         return False
@@ -4547,13 +5152,44 @@ async def maybe_send_proactive_reaction(message: Message, peer_id: int) -> bool:
     if int(LAST_REACTION_CMID_BY_PEER.get(peer_id, 0) or 0) == cmid:
         return False
 
-    prob = float(CHATBOT_PROACTIVE_REACTION_PROBABILITY or 0.0)
-    if prob <= 0:
-        return False
-    if prob < 1 and random.random() > prob:
-        return False
+    allowed_reaction_ids = _normalize_reaction_ids(CHATBOT_PROACTIVE_REACTION_IDS)
+    reaction_id: int | None = None
+    llm_enabled = False
+    if CHATBOT_PROACTIVE_REACTION_USE_LLM:
+        provider, _, _, _, _ = get_llm_settings("reaction")
+        if provider == "groq":
+            if GROQ_API_KEY and AsyncGroq is not None:
+                global groq_client
+                if not groq_client:
+                    groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+                llm_enabled = groq_client is not None
+        elif provider == "venice":
+            llm_enabled = bool(VENICE_API_KEY)
 
-    reaction_id = int(random.choice(CHATBOT_PROACTIVE_REACTION_IDS or [1]))
+    if llm_enabled and message.text:
+        try:
+            should_react, chosen_reaction_id = await choose_proactive_reaction_via_llm(
+                message,
+                peer_id,
+                cmid,
+                allowed_reaction_ids,
+            )
+            # Делаем cooldown и для решения "не ставить реакцию", иначе будет лишняя дерготня на каждое сообщение.
+            LAST_REACTION_TS_BY_PEER[peer_id] = now_ts
+            if not should_react:
+                return False
+            reaction_id = int(chosen_reaction_id or random.choice(allowed_reaction_ids))
+        except Exception as e:
+            log.debug("Proactive reaction LLM failed peer_id=%s cmid=%s: %s", peer_id, cmid, e)
+
+    if reaction_id is None:
+        prob = float(CHATBOT_PROACTIVE_REACTION_PROBABILITY or 0.0)
+        if prob <= 0:
+            return False
+        if prob < 1 and random.random() > prob:
+            return False
+        reaction_id = int(random.choice(allowed_reaction_ids))
+
     try:
         await bot.api.request(
             "messages.sendReaction",
@@ -4561,10 +5197,10 @@ async def maybe_send_proactive_reaction(message: Message, peer_id: int) -> bool:
         )
         LAST_REACTION_TS_BY_PEER[peer_id] = now_ts
         LAST_REACTION_CMID_BY_PEER[peer_id] = cmid
-        mark_bot_activity(peer_id)
         log.debug("Proactive reaction sent peer_id=%s cmid=%s reaction_id=%s", peer_id, cmid, reaction_id)
         return True
     except Exception as e:
+        LAST_REACTION_TS_BY_PEER[peer_id] = now_ts
         log.debug("Proactive reaction failed peer_id=%s cmid=%s: %s", peer_id, cmid, e)
         return False
 
@@ -4666,7 +5302,7 @@ async def maybe_proactive_chatbot(message: Message):
             response_raw = await fetch_llm_messages(
                 llm_messages,
                 max_tokens=CHATBOT_PROACTIVE_MAX_TOKENS,
-                target="chat",
+                target="ops",
                 venice_response_format=VENICE_RESPONSE_FORMAT_PROACTIVE_CHATBOT,
             )
             parsed = try_parse_json_object(response_raw)
@@ -4910,6 +5546,14 @@ async def mention_reply_handler(message: Message):
                     (message.peer_id, message.from_id, "assistant", response_for_store, now_ts),
                 )
             await db.commit()
+        if (
+            CHAT_USER_MEMORY_ENABLED
+            and message.peer_id >= 2_000_000_000
+            and message.from_id
+            and message.from_id > 0
+        ):
+            # После прямого диалога с ботом обновляем память быстрее, чтобы человек не "терялся".
+            asyncio.create_task(update_user_memory(message.peer_id, message.from_id, force=True))
     except httpx.TimeoutException as e:
         log.exception("Mention reply timeout peer_id=%s user_id=%s: %s", message.peer_id, message.from_id, e)
         await send_reply(
@@ -4970,7 +5614,7 @@ async def logger(message: Message):
     if not is_message_allowed(message):
         return
     await store_message(message)
-    if CHAT_SUMMARY_ENABLED:
+    if CHAT_SUMMARY_ENABLED and message.from_id and message.from_id > 0:
         schedule_chat_summary_update(message.peer_id)
     if CHAT_USER_MEMORY_ENABLED and message.from_id and message.from_id > 0:
         schedule_user_memory_update(message.peer_id, message.from_id)
@@ -4993,9 +5637,10 @@ async def start_background_tasks():
     await load_bot_settings()
     await run_runtime_maintenance(force=True)
     log.info(
-        "Loaded settings from DB. game_provider=%s chat_provider=%s chatbot_enabled=%s",
+        "Loaded settings from DB. game_provider=%s chat_provider=%s ops_provider=%s chatbot_enabled=%s",
         LLM_PROVIDER,
         CHAT_LLM_PROVIDER,
+        OPS_LLM_PROVIDER,
         CHATBOT_ENABLED,
     )
     global BOT_GROUP_ID
@@ -5026,9 +5671,10 @@ if __name__ == "__main__":
     log.info("Starting %s bot...", GAME_TITLE)
     allowed_peers_label = "all" if ALLOWED_PEER_IDS is None else format_allowed_peers()
     log.info(
-        "Config game_provider=%s chat_provider=%s allowed_peers=%s chatbot_enabled=%s",
+        "Config game_provider=%s chat_provider=%s ops_provider=%s allowed_peers=%s chatbot_enabled=%s",
         LLM_PROVIDER,
         CHAT_LLM_PROVIDER,
+        OPS_LLM_PROVIDER,
         allowed_peers_label,
         CHATBOT_ENABLED,
     )
