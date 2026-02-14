@@ -16,6 +16,7 @@ from winner_of_day.repositories import (
 )
 from winner_of_day.services import (
     AccessService,
+    AgentRuntimeService,
     ChatbotService,
     ContextService,
     GameService,
@@ -75,6 +76,7 @@ def create_app() -> AppContext:
     services = _build_services(settings_service, settings)
     settings_service.bind_persist(getattr(legacy_bot, "set_bot_setting", None))
     ctx = AppContext(settings=settings, state=state, repos=repos, services=services, bot=legacy_bot.bot)
+    ctx.services["agent_runtime"] = AgentRuntimeService(ctx, legacy_bot)
     register_handlers(legacy_bot.bot, ctx)
     if hasattr(legacy_bot, "set_app_context"):
         legacy_bot.set_app_context(ctx)

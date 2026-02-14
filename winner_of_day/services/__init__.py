@@ -1,4 +1,5 @@
 ﻿from .access_service import AccessService
+from .agent_runtime_service import AgentRuntimeService
 from .chatbot_service import ChatbotService
 from .context_service import ContextService
 from .game_service import GameService
@@ -12,6 +13,7 @@ from .summary_service import SummaryService
 
 __all__ = [
     "AccessService",
+    "AgentRuntimeService",
     "ChatbotService",
     "ContextService",
     "GameService",

@@ -19,6 +19,7 @@ class RuntimeState:
     messages_since_bot_by_peer: dict[int, int] = field(default_factory=dict)
     proactive_locks: dict[int, asyncio.Lock] = field(default_factory=dict)
     game_locks: dict[int, asyncio.Lock] = field(default_factory=dict)
+    agent_locks: dict[int, asyncio.Lock] = field(default_factory=dict)
     last_reaction_ts_by_peer: dict[int, int] = field(default_factory=dict)
     last_reaction_cmid_by_peer: dict[int, int] = field(default_factory=dict)
     processed_message_keys: set[tuple[int, int]] = field(default_factory=set)
