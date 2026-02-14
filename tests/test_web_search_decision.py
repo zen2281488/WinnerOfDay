@@ -34,3 +34,20 @@ def test_web_search_explicit_mode_requires_trigger():
     )
     assert enabled is False
     assert reason == "off"
+
+
+def test_web_search_parameters_force_enable_and_news_source():
+    params = LlmService.build_web_search_parameters(
+        enabled=True,
+        sources_requested=False,
+        explicit_web_request=True,
+        freshness_needed=True,
+        source="auto",
+        query_generation="auto",
+        enable_scraping=False,
+        default_citations=False,
+    )
+    assert params["enable_web_search"] is True
+    assert params["search_source"] == "news"
+    assert params["enable_search_query_generation"] is True
+    assert params["enable_web_citations"] is True

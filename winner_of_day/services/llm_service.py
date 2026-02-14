@@ -67,3 +67,34 @@ class LlmService:
                 return should_enable, sources_requested, "explicit"
             return should_enable, sources_requested, ("smart_hit" if should_enable else "off")
         return False, sources_requested, "off"
+
+    @staticmethod
+    def build_web_search_parameters(
+        *,
+        enabled: bool,
+        sources_requested: bool,
+        explicit_web_request: bool,
+        freshness_needed: bool,
+        source: str = "auto",
+        query_generation: str = "auto",
+        enable_scraping: bool = False,
+        default_citations: bool = False,
+    ) -> dict:
+        if query_generation == "true":
+            query_generation_value: str | bool = True
+        elif query_generation == "false":
+            query_generation_value = False
+        else:
+            query_generation_value = True if (explicit_web_request or freshness_needed) else "auto"
+
+        search_source = source
+        if search_source == "auto" and freshness_needed:
+            search_source = "news"
+
+        return {
+            "enable_web_search": True if enabled else "auto",
+            "search_source": search_source,
+            "enable_search_query_generation": query_generation_value,
+            "enable_web_scraping": bool(enable_scraping),
+            "enable_web_citations": True if (sources_requested or explicit_web_request) else bool(default_citations),
+        }

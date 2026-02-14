@@ -1003,6 +1003,13 @@ if not CHAT_WEB_SOURCES_PROMPT:
         "'Источники' (1-3 пункта) на основе доступных веб-данных. "
         "Если не просит — не добавляй ссылки без необходимости."
     )
+CHAT_WEB_SEARCH_PROMPT = normalize_prompt(os.getenv("CHAT_WEB_SEARCH_PROMPT", "") or "")
+if not CHAT_WEB_SEARCH_PROMPT:
+    CHAT_WEB_SEARCH_PROMPT = (
+        "Если вопрос требует актуальных данных, используй web-search. "
+        "Проверяй даты и выбирай более свежие/надежные источники. "
+        "Если не удалось подтвердить факт — явно скажи об этом."
+    )
 CHAT_IMAGE_VISION_SYSTEM_PROMPT = normalize_prompt(os.getenv("CHAT_IMAGE_VISION_SYSTEM_PROMPT", "") or "")
 if not CHAT_IMAGE_VISION_SYSTEM_PROMPT:
     CHAT_IMAGE_VISION_SYSTEM_PROMPT = (
@@ -5347,21 +5354,38 @@ def _analyze_web_search_hints(user_text: str) -> tuple[bool, bool, bool]:
     sources_requested = bool(WEB_SEARCH_SOURCES_HINTS_RE.search(text))
     return explicit_web_request, freshness_needed, sources_requested
 
-def _build_web_search_parameters_for_sources(sources_requested: bool) -> dict:
+def _build_web_search_parameters_for_sources(
+    *,
+    enabled: bool,
+    sources_requested: bool,
+    explicit_web_request: bool,
+    freshness_needed: bool,
+) -> dict:
     query_generation_value: str | bool
     if CHAT_VENICE_WEB_SEARCH_QUERY_GENERATION == "true":
         query_generation_value = True
     elif CHAT_VENICE_WEB_SEARCH_QUERY_GENERATION == "false":
         query_generation_value = False
     else:
-        query_generation_value = "auto"
+        # В "auto" режиме часто выгодно принудить query generation для явных web/freshness запросов.
+        query_generation_value = True if (explicit_web_request or freshness_needed) else "auto"
+
+    search_source = CHAT_VENICE_WEB_SEARCH_SOURCE
+    if search_source == "auto" and freshness_needed:
+        # Для запросов про "сейчас/сегодня/последнее" повышаем шанс получить свежие источники.
+        search_source = "news"
+
     return {
-        "enable_web_search": "auto",
-        "search_source": CHAT_VENICE_WEB_SEARCH_SOURCE,
+        # При сработавшем триггере включаем поиск явно, а не в "auto",
+        # иначе модель может пропустить web-search даже при явной потребности.
+        "enable_web_search": True if enabled else "auto",
+        "search_source": search_source,
         "enable_search_query_generation": query_generation_value,
         "enable_web_scraping": bool(CHAT_VENICE_WEB_SEARCH_ENABLE_SCRAPING),
         "enable_web_citations": (
-            True if sources_requested else bool(CHAT_VENICE_WEB_SEARCH_DEFAULT_CITATIONS)
+            True
+            if (sources_requested or explicit_web_request)
+            else bool(CHAT_VENICE_WEB_SEARCH_DEFAULT_CITATIONS)
         ),
     }
 
@@ -5396,7 +5420,16 @@ def build_chat_web_search_parameters(user_text: str) -> tuple[dict, bool]:
     enabled, sources_requested, _ = decide_chat_web_search(user_text)
     if not enabled:
         return {}, sources_requested
-    return _build_web_search_parameters_for_sources(sources_requested), sources_requested
+    explicit_web_request, freshness_needed, _ = _analyze_web_search_hints(user_text)
+    return (
+        _build_web_search_parameters_for_sources(
+            enabled=enabled,
+            sources_requested=sources_requested,
+            explicit_web_request=explicit_web_request,
+            freshness_needed=freshness_needed,
+        ),
+        sources_requested,
+    )
 
 def _extract_min_vision_confidence(image_context: str) -> float | None:
     values: list[float] = []
@@ -5426,6 +5459,7 @@ def decide_chat_web_search_with_vision(
     vision_confidence_min: float,
     vision_entities_hint: bool,
 ) -> tuple[bool, bool, str, dict]:
+    explicit_web_request, freshness_needed, sources_requested = _analyze_web_search_hints(user_text)
     enabled, sources_requested, reason = decide_chat_web_search(user_text)
     if not enabled and CHAT_LLM_PROVIDER == "venice" and CHAT_VISION_WEB_FUSION_ENABLED:
         has_image_context = bool(str(image_context or "").strip())
@@ -5440,7 +5474,16 @@ def decide_chat_web_search_with_vision(
                 reason = "fusion_low_conf"
             else:
                 reason = "fusion_entity_hint"
-    parameters = _build_web_search_parameters_for_sources(sources_requested) if enabled else {}
+    parameters = (
+        _build_web_search_parameters_for_sources(
+            enabled=enabled,
+            sources_requested=sources_requested,
+            explicit_web_request=explicit_web_request,
+            freshness_needed=freshness_needed,
+        )
+        if enabled
+        else {}
+    )
     return enabled, sources_requested, reason, parameters
 
 def should_analyze_images(
@@ -9074,6 +9117,18 @@ async def mention_reply_handler(message: Message):
             CHAT_VENICE_WEB_SEARCH_SOURCE,
             CHAT_VENICE_WEB_SEARCH_QUERY_GENERATION,
         )
+        if web_search_enabled:
+            now_msk = datetime.datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M")
+            chat_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"{CHAT_WEB_SEARCH_PROMPT}\n"
+                        f"Текущее время (МСК): {now_msk}. "
+                        "Если пользователь просит 'сегодня/сейчас/последнее', учитывай эту точку времени."
+                    ),
+                }
+            )
         if sources_requested:
             chat_messages.append({"role": "system", "content": CHAT_WEB_SOURCES_PROMPT})
         if image_context:
